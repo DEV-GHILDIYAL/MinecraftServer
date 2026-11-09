@@ -4,6 +4,7 @@ const Docker = require('dockerode');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 // ---------- Config ----------
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
@@ -240,6 +241,7 @@ async function status(s) {
   if (!info) return out;
   out.state = info.State.Status; // running / exited / restarting ...
   out.health = info.State.Health?.Status || null; // starting / healthy / unhealthy
+  out.startedAt = info.State.Running ? info.State.StartedAt : null;
   if (info.State.Running && out.health === 'healthy') {
     try {
       const r = await rcon(s.name, 'list', 3000);
@@ -254,6 +256,7 @@ async function status(s) {
 const busy = new Set();
 const wrap = (fn) => async (req, res) => {
   try { await fn(req, res); } catch (e) {
+    if (res.headersSent) return res.end();
     if (e instanceof BadRequest) return res.status(400).json({ error: e.message });
     console.error(e);
     res.status(500).json({ error: e.message || 'Server error' });
@@ -338,6 +341,50 @@ app.get('/api/servers/:name/logs', wrap(async (req, res) => {
   const tail = Math.min(Math.max(parseInt(req.query.tail, 10) || 300, 10), 2000);
   const buf = await docker.getContainer(cname(s.name)).logs({ stdout: true, stderr: true, tail });
   res.json({ logs: stripAnsi(buf.toString('utf8')) });
+}));
+
+// Live logs via Server-Sent Events
+app.get('/api/servers/:name/logs/stream', wrap(async (req, res) => {
+  const s = servers[req.params.name];
+  if (!s) return res.status(404).json({ error: 'Server not found' });
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+  res.write('event: reset\ndata: {}\n\n');
+  if (!(await inspect(s.name))) { res.write('retry: 5000\n\n'); return res.end(); }
+  const stream = await docker.getContainer(cname(s.name)).logs({ follow: true, stdout: true, stderr: true, tail: 500 });
+  let buf = '';
+  stream.on('data', (chunk) => {
+    buf += chunk.toString('utf8');
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const l of lines) { const t = stripAnsi(l); if (t.trim()) res.write(`data: ${JSON.stringify(t)}\n\n`); }
+  });
+  const ping = setInterval(() => res.write(': ping\n\n'), 20000);
+  const done = () => { clearInterval(ping); stream.destroy?.(); };
+  stream.on('end', () => { done(); res.write('retry: 3000\n\n'); res.end(); }); // container stopped/restarted -> client reconnects
+  stream.on('error', () => { done(); res.end(); });
+  req.on('close', done);
+}));
+
+// CPU / RAM of one server container
+app.get('/api/servers/:name/stats', wrap(async (req, res) => {
+  const s = servers[req.params.name];
+  if (!s) return res.status(404).json({ error: 'Server not found' });
+  const info = await inspect(s.name);
+  if (!info?.State.Running) return res.json({ running: false });
+  const st = await docker.getContainer(cname(s.name)).stats({ stream: false });
+  const cpuDelta = st.cpu_stats.cpu_usage.total_usage - (st.precpu_stats.cpu_usage?.total_usage || 0);
+  const sysDelta = (st.cpu_stats.system_cpu_usage || 0) - (st.precpu_stats.system_cpu_usage || 0);
+  const cpus = st.cpu_stats.online_cpus || os.cpus().length;
+  const cpu = sysDelta > 0 ? (cpuDelta / sysDelta) * cpus * 100 : 0;
+  const mem = (st.memory_stats.usage || 0) - (st.memory_stats.stats?.inactive_file || 0);
+  res.json({ running: true, cpu: Math.round(cpu * 10) / 10, cpuMax: cpus * 100, mem, memLimit: os.totalmem() });
+}));
+
+// Whole machine (EC2) stats
+app.get('/api/host', wrap(async (req, res) => {
+  let disk = null;
+  try { const d = await fs.promises.statfs(path.dirname(DATA_FILE)); disk = { total: d.blocks * d.bsize, free: d.bavail * d.bsize }; } catch {}
+  res.json({ cpus: os.cpus().length, load: os.loadavg()[0], memTotal: os.totalmem(), memFree: os.freemem(), uptime: os.uptime(), disk });
 }));
 
 app.post('/api/servers/:name/command', wrap(async (req, res) => {
