@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Minecraft Panel</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Login -->
+  <section id="login-view" class="center hidden">
+    <form id="login-form" class="card login">
+      <h1>⛏ Minecraft Panel</h1>
+      <input type="password" id="password" placeholder="Admin password" autocomplete="current-password" required>
+      <button class="btn primary" type="submit">Login</button>
+      <p id="login-error" class="error"></p>
+    </form>
+  </section>
+
+  <!-- Dashboard -->
+  <section id="app-view" class="hidden">
+    <header>
+      <h1>⛏ Minecraft Panel</h1>
+      <div>
+        <button class="btn primary" id="new-btn">+ New Server</button>
+        <button class="btn" id="logout-btn">Logout</button>
+      </div>
+    </header>
+    <main>
+      <div id="servers" class="grid"></div>
+      <div id="empty" class="card empty hidden">
+        <h2>Abhi koi server nahi hai</h2>
+        <p>"+ New Server" dabao — name, difficulty, players sab set karo aur Create karo.</p>
+      </div>
+    </main>
+  </section>
+
+  <!-- Create / Edit modal -->
+  <div id="form-modal" class="modal hidden">
+    <form id="server-form" class="card modal-box">
+      <h2 id="form-title">New Server</h2>
+      <div id="form-fields" class="form-grid"></div>
+      <p class="note" id="form-note"></p>
+      <p id="form-error" class="error"></p>
+      <div class="actions">
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn primary" id="form-submit">Create</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Console modal -->
+  <div id="console-modal" class="modal hidden">
+    <div class="card modal-box wide">
+      <div class="console-head">
+        <h2 id="console-title">Console</h2>
+        <button type="button" class="btn" data-close>Close</button>
+      </div>
+      <pre id="console-logs"></pre>
+      <form id="console-form" class="console-input">
+        <input id="console-cmd" placeholder="Command, e.g.  op Steve   |   time set day   |   whitelist add Alex" autocomplete="off">
+        <button class="btn primary" type="submit">Send</button>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
