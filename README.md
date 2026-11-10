@@ -72,10 +72,19 @@ sudo docker logs -f mc-<name>              # kisi server ke logs
 git pull && sudo docker compose up -d --build   # panel update
 ```
 
-**Backup:** world data Docker volume `mc-<name>-data` mein hai:
-```bash
-sudo docker run --rm -v mc-<name>-data:/data -v $PWD:/backup alpine tar czf /backup/<name>-backup.tgz -C /data .
-```
+## 💾 Backups & World regenerate
+
+- **Auto backup:** har `BACKUP_INTERVAL_HOURS` (default 6) ghante mein chalte hue server ka world backup hota hai.
+  `0` = band. Disk 2 GB se kam ho to auto backup skip hota hai.
+- **Settings change se pehle** apne aap backup hota hai (sirf jab sach mein kuch badla ho).
+- **Regenerate / Restore se pehle** bhi purane world ka backup liya jata hai, to kuch bhi galat hua to wapas aa sakte ho.
+- Har server ke last `BACKUP_KEEP` (default 8) auto backups + 8 baaki backups rakhe jaate hain, purane delete.
+- **Backups tab:** Backup now, ↩ Restore (chaaho to us waqt ki settings bhi), ⬇ Download, 🗑 Delete.
+- **Settings → 🌍 Regenerate world:** world glitch / void mein gir rahe ho? Naya Overworld + Nether + End banta hai
+  (seed khaali = random). Plugins, ops, whitelist, settings same rehte hain.
+
+Backups Docker volume `mc-backups` mein hain (EC2 disk par hi). Off-site copy ke liye ⬇ Download karke apne PC par rakho.
+Server delete karne par bhi uske backups rehte hain.
 
 ## Security notes
 - Panel ke paas Docker ka control hai (= server ka root access). **Strong password** rakho aur

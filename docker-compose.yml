@@ -10,6 +10,10 @@ services:
       # Panel Docker ko control karta hai taaki Minecraft server containers bana sake
       - /var/run/docker.sock:/var/run/docker.sock
       - panel-data:/app/data
+      # World backups (also mounted by short-lived helper containers, so the name must stay "mc-backups")
+      - backups:/app/backups
 
 volumes:
   panel-data:
+  backups:
+    name: mc-backups

@@ -40,7 +40,9 @@ sudo docker run --rm -v mc-$N-data:/data -v "$PWD":/backup alpine sh -c "rm -rf 
 4. `sudo docker cp servers.json mc-panel:/app/data/servers.json && sudo docker compose restart panel`
 5. Press **Start** on each server in the UI. The panel recreates missing containers from the registry.
 
-## Possible feature
-There's no backup endpoint in the panel yet. If the user wants one, use the `add-api-endpoint`
-skill: run `exec` with `rcon-cli save-all`, stream a tar of the volume via a helper container, lock it
-with `withServer`, and have it reviewed by `panel-security-reviewer`.
+## Built-in panel backups (preferred)
+The panel has a **💾 Backups** tab (auto every `BACKUP_INTERVAL_HOURS`, before every settings change,
+regenerate and restore, plus manual), and **Settings → 🌍 Regenerate world**. See "Backups" in `CLAUDE.md`.
+The panel's backup files sit in the `mc-backups` volume: `/var/lib/docker/volumes/mc-backups/_data/<server>/*.tgz`
+on the host. Those tarballs can be restored with the manual command above as well. The manual steps here are
+for when the panel itself is broken, or for migrations.

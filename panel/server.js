@@ -15,6 +15,12 @@ const PORT_END = parseInt(process.env.MC_PORT_END || '25575', 10);
 const TZ = process.env.TZ || 'UTC';
 const IMAGE = 'itzg/minecraft-server';
 const DATA_FILE = path.join(__dirname, 'data', 'servers.json');
+// Backups live in the Docker volume "mc-backups", mounted into the panel at /app/backups
+// (see docker-compose.yml) and into short-lived helper containers at /backups.
+const BACKUP_DIR = path.join(__dirname, 'backups');
+const BACKUP_VOLUME = 'mc-backups';
+const BACKUP_INTERVAL_H = Math.max(0, parseFloat(process.env.BACKUP_INTERVAL_HOURS ?? '6') || 0); // 0 = auto backups off
+const BACKUP_KEEP = Math.min(100, Math.max(1, parseInt(process.env.BACKUP_KEEP || '8', 10) || 8));
 
 if (ADMIN_PASSWORD.length < 8 || ADMIN_PASSWORD === 'change-me-please') {
   console.error('ERROR: set a strong ADMIN_PASSWORD (min 8 chars) in .env');
@@ -252,6 +258,107 @@ async function status(s) {
   return out;
 }
 
+// ---------- Backups ----------
+// File: backups/<server>/<YYYY-MM-DD_HH-MM-SS>_<reason>.tgz (UTC) + same name .json with a settings snapshot
+const REASONS = ['auto', 'manual', 'settings', 'regenerate', 'restore'];
+const BACKUP_RE = new RegExp(`^(\\d{4}-\\d{2}-\\d{2})_(\\d{2})-(\\d{2})-(\\d{2})_(${REASONS.join('|')})\\.tgz$`);
+const TAR_EXCLUDES = ['./libraries', './versions', './cache', './.cache', './logs', './crash-reports'].map((p) => `--exclude=${p}`);
+const WORLD_DIRS = ['/data/world', '/data/world_nether', '/data/world_the_end'];
+
+const stamp = () => new Date().toISOString().slice(0, 19).replace('T', '_').replace(/:/g, '-');
+const backupDir = (name) => path.join(BACKUP_DIR, name);
+
+function listBackups(name) {
+  let files = [];
+  try { files = fs.readdirSync(backupDir(name)); } catch { return []; }
+  return files.map((f) => f.match(BACKUP_RE) && [f, f.match(BACKUP_RE)]).filter(Boolean).map(([file, m]) => {
+    let size = 0;
+    try { size = fs.statSync(path.join(backupDir(name), file)).size; } catch {}
+    return {
+      file, size, reason: m[5],
+      createdAt: `${m[1]}T${m[2]}:${m[3]}:${m[4]}Z`,
+      hasSettings: fs.existsSync(path.join(backupDir(name), file.replace(/\.tgz$/, '.json'))),
+    };
+  }).sort((a, b) => (a.file < b.file ? 1 : -1)); // newest first
+}
+
+function readBackupMeta(name, file) {
+  try { return JSON.parse(fs.readFileSync(path.join(backupDir(name), file.replace(/\.tgz$/, '.json')), 'utf8')); } catch { return null; }
+}
+
+// Validates a backup file name from the URL and makes sure it exists
+function backupFile(name, file) {
+  if (!BACKUP_RE.test(String(file))) throw new BadRequest('Invalid backup name');
+  if (!fs.existsSync(path.join(backupDir(name), file))) throw new BadRequest('Backup not found');
+  return file;
+}
+
+function removeBackup(name, file) {
+  for (const f of [file, file.replace(/\.tgz$/, '.json')]) fs.rmSync(path.join(backupDir(name), f), { force: true });
+}
+
+// Keep the newest BACKUP_KEEP auto backups and BACKUP_KEEP of the other kinds
+function pruneBackups(name, protect) {
+  const all = listBackups(name);
+  for (const group of [all.filter((b) => b.reason === 'auto'), all.filter((b) => b.reason !== 'auto')]) {
+    for (const b of group.slice(BACKUP_KEEP)) if (b.file !== protect) removeBackup(name, b.file);
+  }
+}
+
+// Runs a throwaway container (same image as the server, so nothing extra is pulled) with the given argv
+async function runHelper(s, argv, binds, okCodes = [0]) {
+  const img = imageFor(s.version);
+  await ensureImage(img);
+  const c = await docker.createContainer({
+    Image: img, Entrypoint: [argv[0]], Cmd: argv.slice(1), User: '0:0',
+    Labels: { 'mcpanel.helper': '1', 'mcpanel.name': s.name },
+    HostConfig: { Binds: binds, NetworkMode: 'none' },
+  });
+  try {
+    await c.start();
+    const r = await c.wait();
+    if (!okCodes.includes(r.StatusCode)) {
+      const logs = (await c.logs({ stdout: true, stderr: true }).catch(() => Buffer.from(''))).toString('utf8');
+      throw new Error(`Helper failed (exit ${r.StatusCode}): ${logs.replace(/[\x00-\x08\x0e-\x1f]/g, '').trim().slice(-300)}`);
+    }
+  } finally {
+    await c.remove({ force: true }).catch(() => {});
+  }
+}
+
+// Consistent backup: pause world saving on a running server, tar the volume, resume saving
+async function backup(s, reason, protect) {
+  fs.mkdirSync(backupDir(s.name), { recursive: true });
+  const file = `${stamp()}_${reason}.tgz`;
+  const partial = path.join(backupDir(s.name), file + '.partial');
+  const info = await inspect(s.name);
+  const live = !!(info?.State.Running && info.State.Health?.Status === 'healthy');
+  if (live) {
+    await rcon(s.name, 'save-off', 5000).catch(() => {});
+    await rcon(s.name, 'save-all flush', 60000).catch(() => {});
+  }
+  try {
+    // tar exit 1 = "file changed while reading" (archive is still written) -> accepted
+    await runHelper(s, ['tar', 'czf', `/backups/${s.name}/${file}.partial`, '-C', '/data', ...TAR_EXCLUDES, '.'],
+      [`mc-${s.name}-data:/data:ro`, `${BACKUP_VOLUME}:/backups`], [0, 1]);
+    fs.renameSync(partial, path.join(backupDir(s.name), file));
+  } catch (e) {
+    fs.rmSync(partial, { force: true });
+    throw new Error(`Backup failed: ${e.message}`);
+  } finally {
+    if (live) await rcon(s.name, 'save-on', 5000).catch(() => {});
+  }
+  fs.writeFileSync(path.join(backupDir(s.name), file.replace(/\.tgz$/, '.json')), JSON.stringify({ reason, settings: s }, null, 2));
+  pruneBackups(s.name, protect);
+  console.log(`Backup ${s.name}/${file} done`);
+  return file;
+}
+
+// Deletes the world folders (keeps plugins, ops, whitelist, config) and forgets the old level-seed
+const REGEN_SCRIPT = `rm -rf ${WORLD_DIRS.join(' ')} && { [ ! -f /data/server.properties ] || sed -i '/^level-seed=/d' /data/server.properties; }`;
+// Wipes /data (except re-downloadable server files) and unpacks the backup given as $1
+const RESTORE_SCRIPT = 'find /data -mindepth 1 -maxdepth 1 ! -name libraries ! -name versions ! -name cache -exec rm -rf {} + && tar xzf "$1" -C /data';
+
 // per-server lock so two actions don't race
 const busy = new Set();
 const wrap = (fn) => async (req, res) => {
@@ -273,7 +380,7 @@ function withServer(fn) {
 }
 
 // ---------- API ----------
-app.get('/api/config', (req, res) => res.json({ publicHost: PUBLIC_HOST, portStart: PORT_START, portEnd: PORT_END, defaults: DEFAULTS, enums: ENUMS }));
+app.get('/api/config', (req, res) => res.json({ publicHost: PUBLIC_HOST, portStart: PORT_START, portEnd: PORT_END, defaults: DEFAULTS, enums: ENUMS, backup: { intervalHours: BACKUP_INTERVAL_H, keep: BACKUP_KEEP } }));
 
 app.get('/api/servers', wrap(async (req, res) => {
   res.json(await Promise.all(Object.values(servers).map(status)));
@@ -305,6 +412,10 @@ app.post('/api/servers', wrap(async (req, res) => {
 app.put('/api/servers/:name', withServer(async (s, req, res) => {
   const { name, port, createdAt } = s;
   const updated = { ...sanitize(req.body, s), name, port, createdAt };
+  const before = { ...DEFAULTS, ...s };
+  const changed = Object.keys(updated).some((k) => JSON.stringify(updated[k]) !== JSON.stringify(before[k]));
+  if (!changed) return res.json({ ...(await status(s)), unchanged: true }); // nothing to do: no backup, no restart
+  await backup(s, 'settings'); // snapshot BEFORE applying new settings; aborts the save if it fails
   const wasRunning = await removeContainer(name);
   servers[name] = updated;
   saveServers(servers);
@@ -397,6 +508,91 @@ app.post('/api/servers/:name/command', wrap(async (req, res) => {
   res.json({ output: await rcon(s.name, cmd) });
 }));
 
+// ---------- World regenerate / backups ----------
+app.post('/api/servers/:name/regenerate', withServer(async (s, req, res) => {
+  const { name, port, createdAt } = s;
+  const input = { seed: req.body?.seed ?? '' };
+  if (req.body?.levelType) input.levelType = req.body.levelType;
+  const updated = { ...sanitize(input, s), name, port, createdAt };
+  await backup(s, 'regenerate'); // old world is kept as a backup
+  await removeContainer(name);
+  await runHelper(s, ['sh', '-c', REGEN_SCRIPT], [`mc-${name}-data:/data`]);
+  servers[name] = updated;
+  saveServers(servers);
+  await createContainer(updated); // starts and generates a fresh world
+  res.json(await status(updated));
+}));
+
+app.get('/api/servers/:name/backups', wrap(async (req, res) => {
+  const s = servers[req.params.name];
+  if (!s) return res.status(404).json({ error: 'Server not found' });
+  res.json({ backups: listBackups(s.name), intervalHours: BACKUP_INTERVAL_H, keep: BACKUP_KEEP });
+}));
+
+app.post('/api/servers/:name/backups', withServer(async (s, req, res) => {
+  res.json({ file: await backup(s, 'manual') });
+}));
+
+app.post('/api/servers/:name/backups/:file/restore', withServer(async (s, req, res) => {
+  const file = backupFile(s.name, req.params.file);
+  const meta = readBackupMeta(s.name, file);
+  await backup(s, 'restore', file); // safety copy of the current world; never prunes the one being restored
+  const { name, port, createdAt } = s;
+  let next = s;
+  if (req.body?.restoreSettings && meta?.settings) next = { ...sanitize(meta.settings, s), name, port, createdAt };
+  const wasRunning = await removeContainer(name);
+  await runHelper(s, ['sh', '-c', RESTORE_SCRIPT, 'sh', `/backups/${name}/${file}`],
+    [`mc-${name}-data:/data`, `${BACKUP_VOLUME}:/backups:ro`]);
+  servers[name] = next;
+  saveServers(servers);
+  await createContainer(next);
+  if (!wasRunning) await docker.getContainer(cname(name)).stop({ t: 60 }).catch(() => {});
+  res.json(await status(next));
+}));
+
+app.get('/api/servers/:name/backups/:file/download', wrap(async (req, res) => {
+  const s = servers[req.params.name];
+  if (!s) return res.status(404).json({ error: 'Server not found' });
+  const file = backupFile(s.name, req.params.file);
+  res.download(path.join(backupDir(s.name), file), `${s.name}_${file}`);
+}));
+
+app.delete('/api/servers/:name/backups/:file', withServer(async (s, req, res) => {
+  removeBackup(s.name, backupFile(s.name, req.params.file));
+  res.json({ ok: true });
+}));
+
+// ---------- Auto backup scheduler ----------
+let ticking = false;
+async function autoBackupTick() {
+  if (!BACKUP_INTERVAL_H || ticking) return;
+  ticking = true;
+  try {
+    for (const s of Object.values(servers)) {
+      if (busy.has(s.name)) continue;
+      const info = await inspect(s.name).catch(() => null);
+      if (!info?.State.Running) continue; // stopped worlds don't change
+      const last = listBackups(s.name)[0];
+      if (last && Date.now() - new Date(last.createdAt).getTime() < BACKUP_INTERVAL_H * 3600e3) continue;
+      try {
+        const d = await fs.promises.statfs(BACKUP_DIR);
+        if (d.bavail * d.bsize < 2 * 1024 ** 3) { console.warn('Auto backup skipped: less than 2 GB disk free'); continue; }
+      } catch {}
+      if (!servers[s.name] || busy.has(s.name)) continue;
+      busy.add(s.name);
+      try { await backup(s, 'auto'); } catch (e) { console.error(`Auto backup ${s.name}:`, e.message); } finally { busy.delete(s.name); }
+    }
+  } finally { ticking = false; }
+}
+
 app.use(express.static(path.join(__dirname, 'public')));
 
-app.listen(8080, () => console.log('Minecraft panel running on :8080'));
+fs.mkdirSync(BACKUP_DIR, { recursive: true });
+// remove helper containers left behind if the panel was killed mid-backup
+docker.listContainers({ all: true, filters: { label: ['mcpanel.helper=1'] } })
+  .then((list) => Promise.all(list.map((c) => docker.getContainer(c.Id).remove({ force: true }).catch(() => {}))))
+  .catch(() => {});
+setTimeout(autoBackupTick, 60 * 1000);
+setInterval(autoBackupTick, 10 * 60 * 1000);
+
+app.listen(8080, () => console.log(`Minecraft panel running on :8080 (auto backup: ${BACKUP_INTERVAL_H ? `every ${BACKUP_INTERVAL_H}h, keep ${BACKUP_KEEP}` : 'off'})`));

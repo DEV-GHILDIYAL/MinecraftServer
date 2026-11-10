@@ -30,7 +30,7 @@ There's no build step, no framework, no database, no tests. Everything is plain 
 | `panel/Dockerfile` | `node:20-alpine`, `npm install --omit=dev`, `node server.js` |
 | `docker-compose.yml` | Panel service only; mounts docker.sock + `panel-data` volume |
 | `setup.sh` | One-time EC2 bootstrap: Docker, 2G swap, `.env` generation, ufw, image pre-pull, `compose up` |
-| `.env.example` | `ADMIN_PASSWORD`, `SESSION_SECRET`, `PUBLIC_HOST`, `PANEL_PORT`, `MC_PORT_START/END`, `TZ` |
+| `.env.example` | `ADMIN_PASSWORD`, `SESSION_SECRET`, `PUBLIC_HOST`, `PANEL_PORT`, `MC_PORT_START/END`, `TZ`, `BACKUP_INTERVAL_HOURS`, `BACKUP_KEEP` |
 
 ## Backend (`panel/server.js`) mental model
 
@@ -78,6 +78,25 @@ There's no build step, no framework, no database, no tests. Everything is plain 
 | GET | `/api/servers/:name/stats` | cpu %, cpuMax, mem bytes |
 | GET | `/api/host` | host load / mem / disk / uptime |
 | POST | `/api/servers/:name/command` `{command}` | RCON; strips a leading `/`, max 500 chars |
+| POST | `/api/servers/:name/regenerate` `{seed, levelType}` | backup → delete world dirs + `level-seed` → recreate & start |
+| GET | `/api/servers/:name/backups` | `{backups:[{file,reason,size,createdAt,hasSettings}], intervalHours, keep}` |
+| POST | `/api/servers/:name/backups` | manual backup |
+| POST | `/api/servers/:name/backups/:file/restore` `{restoreSettings}` | safety backup → wipe `/data` (keeps libraries/versions/cache) → untar |
+| GET | `/api/servers/:name/backups/:file/download` | the .tgz file |
+| DELETE | `/api/servers/:name/backups/:file` | |
+
+### Backups
+- Stored in the volume **`mc-backups`** (fixed name in compose), mounted in the panel at `/app/backups/<server>/`.
+  Files are named `YYYY-MM-DD_HH-MM-SS_<reason>.tgz` (UTC), where reason is `auto|manual|settings|regenerate|restore`.
+  A `.json` sidecar holds the settings snapshot. `BACKUP_RE` validates every name that comes from a URL.
+- Tar, regenerate and restore run in **helper containers** (`runHelper`) that use the server's own itzg image,
+  `NetworkMode: none`, label `mcpanel.helper=1`, and get removed afterwards. Leftovers are cleaned up when the panel starts.
+- `backup()` sends `save-off` + `save-all flush` over RCON before tar when the server is healthy, and `save-on` after.
+- `PUT` settings: if nothing changed it returns `{unchanged:true}`, with no backup and no restart. Otherwise
+  `backup(s,'settings')` runs first, and a failed backup aborts the save.
+- Scheduler: `autoBackupTick` runs every 10 min, 1 min after the panel starts. It backs up running servers whose newest backup
+  is older than `BACKUP_INTERVAL_HOURS`, and skips if less than 2 GB is free. It takes the `busy` lock, so user actions get a 409 meanwhile.
+- Retention: `BACKUP_KEEP` newest auto backups, plus `BACKUP_KEEP` of all the other kinds together.
 
 ## Frontend (`panel/public/app.js`) mental model
 

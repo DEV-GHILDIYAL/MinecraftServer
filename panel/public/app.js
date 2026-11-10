@@ -212,7 +212,7 @@ function renderMain() {
       el('button', { class: 'mc-btn green', style: 'padding:12px 22px;font-size:15px', onclick: () => openCreate() }, '+ Create your first server')));
     return;
   }
-  const tabs = [['overview', '📊 Overview'], ['console', '⌨ Console'], ['players', '👥 Players'], ['settings', '⚙ Settings']];
+  const tabs = [['overview', '📊 Overview'], ['console', '⌨ Console'], ['players', '👥 Players'], ['backups', '💾 Backups'], ['settings', '⚙ Settings']];
   main.replaceChildren(
     renderHero(s),
     el('div', { class: 'tabs' }, tabs.map(([id, label]) => el('button', {
@@ -221,6 +221,7 @@ function renderMain() {
     }, label, id === 'players' && s.players?.online ? el('span', { class: 'badge' }, String(s.players.online)) : null))),
     el('div', { id: 'tab-body' }, state.tab === 'console' ? renderConsoleTab()
       : state.tab === 'players' ? renderPlayersTab(s)
+        : state.tab === 'backups' ? renderBackupsTab(s)
         : state.tab === 'settings' ? renderSettingsTab(s)
           : renderOverviewTab(s)));
   paintConsoles();
@@ -621,20 +622,124 @@ function renderSettingsTab(s) {
   const btn = el('button', { class: 'mc-btn green', type: 'submit' }, '💾 Save & Apply');
   const form = el('form', { onsubmit: async (e) => {
     e.preventDefault();
-    btn.disabled = true; btn.replaceChildren(el('span', { class: 'spin' }), ' Applying…'); err.textContent = '';
+    btn.disabled = true; btn.replaceChildren(el('span', { class: 'spin' }), ' Backup + Applying…'); err.textContent = '';
     try {
-      await api(`/api/servers/${s.name}`, { method: 'PUT', body: readForm(form) });
-      toast('✅ Settings saved — server restart ho raha hai');
+      const r = await api(`/api/servers/${s.name}`, { method: 'PUT', body: readForm(form) });
+      if (r.unchanged) { toast('Kuch change nahi hua — backup/restart ki zaroorat nahi'); btn.disabled = false; btn.replaceChildren('💾 Save & Apply'); return; }
+      toast('✅ Backup liya + settings saved — server restart ho raha hai');
       await refreshServers();
       openLogStream();
       select(s.name, 'overview');
     } catch (ex) { err.textContent = ex.message; btn.disabled = false; btn.replaceChildren('💾 Save & Apply'); }
   } }, buildForm(s, false),
-  el('div', { class: 'form-foot' }, el('span', { class: 'note' }, '⚠ Save karne par server restart hoga (world safe rehta hai).'), btn), err);
+  el('div', { class: 'form-foot' }, el('span', { class: 'note' }, '⚠ Save se pehle auto backup liya jayega, phir server restart hoga.'), btn), err);
   return el('div', { style: 'display:grid;gap:14px' }, form,
+    el('div', { class: 'card danger-zone' },
+      el('div', {}, el('b', { style: 'color:var(--gold)' }, '🌍 World regenerate'), el('div', { class: 'muted', style: 'font-size:13px' }, 'World kharab / glitch ho gaya? Naya world banao — purana pehle backup ho jayega')),
+      el('button', { class: 'mc-btn gold', type: 'button', onclick: () => openRegenerate(s) }, 'Regenerate world')),
     el('div', { class: 'card danger-zone' },
       el('div', {}, el('b', { style: 'color:var(--redstone)' }, '☠ Danger zone'), el('div', { class: 'muted', style: 'font-size:13px' }, 'Server ko hamesha ke liye delete karo')),
       el('button', { class: 'mc-btn red', type: 'button', onclick: () => openDelete(s) }, 'Delete server')));
+}
+
+/* ---------- backups ---------- */
+const REASON_LABEL = {
+  auto: '⏱ Auto', manual: '✋ Manual', settings: '⚙ Settings change se pehle',
+  regenerate: '🌍 Regenerate se pehle', restore: '↩ Restore se pehle',
+};
+
+function renderBackupsTab(s) {
+  const b = state.config.backup || {};
+  const list = el('div', { id: 'backups-list', style: 'display:grid;gap:8px' }, el('span', { class: 'muted' }, 'Loading…'));
+  const btn = el('button', { class: 'mc-btn green', onclick: async () => {
+    btn.disabled = true; btn.replaceChildren(el('span', { class: 'spin' }), ' Backup ho raha hai…');
+    try { await api(`/api/servers/${s.name}/backups`, { method: 'POST' }); toast('💾 Backup ho gaya!'); } catch (err) { toast(err.message, true); }
+    btn.disabled = false; btn.replaceChildren('💾 Backup now');
+    loadBackups(s);
+  } }, '💾 Backup now');
+  loadBackups(s);
+  return el('div', { style: 'display:grid;gap:14px' },
+    el('div', { class: 'card danger-zone', style: 'border-color:var(--border);background:var(--panel)' },
+      el('div', {},
+        el('b', {}, '💾 World backups'),
+        el('div', { class: 'muted', style: 'font-size:13px' }, b.intervalHours
+          ? `Auto backup har ${b.intervalHours} ghante (jab server chal raha ho) · settings change / regenerate / restore se pehle bhi · last ${b.keep} rakhe jaate hain`
+          : `Auto backup OFF (.env mein BACKUP_INTERVAL_HOURS) · settings change / regenerate / restore se pehle backup hota hai`)),
+      btn),
+    el('div', { class: 'card' }, el('div', { class: 'card-title' }, 'Saved backups'), list));
+}
+
+async function loadBackups(s) {
+  let data;
+  try { data = await api(`/api/servers/${s.name}/backups`); } catch (err) { data = { backups: [], error: err.message }; }
+  const list = $('#backups-list');
+  if (!list || state.selected !== s.name) return;
+  if (!data.backups.length) {
+    list.replaceChildren(el('span', { class: 'muted' }, data.error || 'Abhi koi backup nahi. "Backup now" dabao.'));
+    return;
+  }
+  list.replaceChildren(...data.backups.map((bk) => el('div', { class: 'backup-row' },
+    el('div', { class: 'grow' },
+      el('div', { style: 'font-weight:600' }, new Date(bk.createdAt).toLocaleString()),
+      el('div', { class: 'muted', style: 'font-size:12px' }, `${REASON_LABEL[bk.reason] || bk.reason} · ${fmtBytes(bk.size)}`)),
+    el('button', { class: 'mc-btn blue small', onclick: () => openRestore(s, bk) }, '↩ Restore'),
+    el('a', { class: 'mc-btn ghost small', href: `/api/servers/${encodeURIComponent(s.name)}/backups/${encodeURIComponent(bk.file)}/download`, title: 'Download' }, '⬇'),
+    el('button', { class: 'mc-btn ghost small', title: 'Delete', onclick: () => confirmModal('Backup delete karein?', `${new Date(bk.createdAt).toLocaleString()} wala backup hamesha ke liye delete ho jayega.`, 'Delete', async () => {
+      try { await api(`/api/servers/${s.name}/backups/${encodeURIComponent(bk.file)}`, { method: 'DELETE' }); toast('🗑 Backup deleted'); } catch (err) { toast(err.message, true); }
+      loadBackups(s);
+    }) }, '🗑'))));
+}
+
+function openRestore(s, bk) {
+  const settingsBox = el('input', { type: 'checkbox', checked: true });
+  const err = el('p', { class: 'error' });
+  const btn = el('button', { class: 'mc-btn blue', type: 'submit' }, '↩ Restore');
+  openModal([el('form', { onsubmit: async (e) => {
+    e.preventDefault();
+    btn.disabled = true; btn.replaceChildren(el('span', { class: 'spin' }), ' Restoring… (1–3 min)'); err.textContent = '';
+    try {
+      await api(`/api/servers/${s.name}/backups/${encodeURIComponent(bk.file)}/restore`, { method: 'POST', body: { restoreSettings: bk.hasSettings && settingsBox.checked } });
+      closeModal();
+      toast('↩ World restore ho gaya!');
+      await refreshServers();
+      select(s.name, 'console');
+    } catch (ex) { err.textContent = ex.message; btn.disabled = false; btn.replaceChildren('↩ Restore'); }
+  } },
+  el('h2', {}, 'World restore karein?'),
+  el('p', { class: 'muted' }, `Abhi ka world hata ke ${new Date(bk.createdAt).toLocaleString()} wala world wapas aayega. Abhi wale world ka bhi pehle safety backup liya jayega.`),
+  bk.hasSettings ? el('label', { class: 'toggle', style: 'margin-top:8px;color:var(--text)' }, settingsBox, 'Us waqt ki server settings bhi wapas lagao') : null,
+  err,
+  el('div', { class: 'modal-actions' }, el('button', { class: 'mc-btn ghost', type: 'button', onclick: closeModal }, 'Cancel'), btn))], true);
+}
+
+function openRegenerate(s) {
+  const nameInput = el('input', { placeholder: s.name, autocomplete: 'off' });
+  const seedInput = el('input', { placeholder: 'Khaali = random naya world', maxlength: 64 });
+  const typeSel = el('select', {}, state.config.enums.levelType.map((o) => el('option', { value: o, selected: o === s.levelType }, o.replace('minecraft:', '').replace('_', ' '))));
+  const err = el('p', { class: 'error' });
+  const btn = el('button', { class: 'mc-btn gold', type: 'submit' }, '🌍 Regenerate');
+  openModal([el('form', { onsubmit: async (e) => {
+    e.preventDefault();
+    if (nameInput.value !== s.name) { err.textContent = 'Naam match nahi hua'; return; }
+    btn.disabled = true; btn.replaceChildren(el('span', { class: 'spin' }), ' Backup + naya world… (1–3 min)'); err.textContent = '';
+    try {
+      await api(`/api/servers/${s.name}/regenerate`, { method: 'POST', body: { seed: seedInput.value.trim(), levelType: typeSel.value } });
+      closeModal();
+      toast('🌍 Naya world ban raha hai — purana Backups tab mein hai');
+      await refreshServers();
+      openLogStream();
+      select(s.name, 'console');
+    } catch (ex) { err.textContent = ex.message; btn.disabled = false; btn.replaceChildren('🌍 Regenerate'); }
+  } },
+  el('h2', {}, `"${s.name}" ka world regenerate karein?`),
+  el('p', { class: 'muted' }, 'Overworld, Nether aur End naye banenge. Plugins, ops, whitelist aur settings same rahenge. Purana world pehle backup hoga (Backups tab se wapas la sakte ho).'),
+  el('label', { class: 'field' }, 'Seed', seedInput),
+  el('label', { class: 'field', style: 'margin-top:10px' }, 'World type', typeSel),
+  el('p', { class: 'muted', style: 'margin:12px 0 6px' }, 'Confirm karne ke liye server ka naam type karo:'),
+  nameInput,
+  err,
+  el('div', { class: 'modal-actions' }, el('button', { class: 'mc-btn ghost', type: 'button', onclick: closeModal }, 'Cancel'), btn))], true);
+  setTimeout(() => seedInput.focus(), 50);
 }
 
 /* ================= modals ================= */
