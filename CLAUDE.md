@@ -53,8 +53,15 @@ There's no build step, no framework, no database, no tests. Everything is plain 
   Read-only routes (logs, stats, command) use plain `wrap()` without the lock.
 - **Errors**: throw `new BadRequest(msg)` → 400 with `{error}`. Anything else → 500 with `e.message`.
   Always wrap async handlers with `wrap()` or `withServer()`.
-- **Auth**: one shared `ADMIN_PASSWORD`. The cookie `session=<exp>.<hmac>` is stateless, HMAC-SHA256
-  with `SESSION_SECRET`, and lasts 7 days. Cookie flags: HttpOnly, SameSite=Strict. After 10 failed
+- **Auth**: an admin (`ADMIN_PASSWORD`, username blank or `admin`) plus **view-only accounts** in `data/users.json`
+  (0600, scrypt, managed by the admin under 👥 Users). The cookie `session=<exp>.<role>.<user>.<ver>.<hmac>` is
+  HMAC-SHA256 with `SESSION_SECRET` and lasts 7 days. `ver` is per-viewer and rotated on password reset or delete;
+  for the admin it is derived from `ADMIN_PASSWORD`, so all of these revoke old sessions. Viewers pass the `/api`
+  guard only for GETs matching the `VIEWER_GET` **allowlist** (case-insensitive, optional trailing slash, because
+  Express matches those too). New routes are therefore admin-only by default; add a read-only route to
+  `VIEWER_GET` only if viewers should see it. Backup downloads and `/api/users` are deliberately not on it.
+  Log endpoints mask IPv4 addresses for viewers (`maskIps`). The frontend hides admin controls via `isAdmin()`, but that is
+  only cosmetic: the server guard is the real check. Cookie flags: HttpOnly, SameSite=Strict. After 10 failed
   logins an IP is locked out for 10 min (in-memory map). `/api/login`, `/api/logout` and `/api/me`
   are registered **before** the `app.use('/api', ...)` auth guard. Every route after it is protected.
   Static files are served last.
@@ -65,9 +72,10 @@ There's no build step, no framework, no database, no tests. Everything is plain 
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/api/login` `{password}` | sets cookie |
+| POST | `/api/login` `{username?, password}` | sets cookie; blank username = admin |
 | POST | `/api/logout` | |
-| GET | `/api/me` | `{loggedIn}` (public) |
+| GET | `/api/me` | `{loggedIn, role, user}` (public) |
+| GET / POST / DELETE | `/api/users` · `/api/users/:u` | admin only: list viewers; create or reset password `{username, password}`; delete |
 | GET | `/api/config` | publicHost, port range, `DEFAULTS`, `ENUMS` (the frontend builds its form from these) |
 | GET | `/api/servers` | array of `status(s)`: settings + `state`, `health`, `players`, `address`, `startedAt` |
 | POST | `/api/servers` | create; `name` must match `^[a-z0-9][a-z0-9-]{0,30}$`; port is auto-assigned if omitted |

@@ -72,7 +72,9 @@ const state = {
   hideNoise: true,
   autoscroll: true,
   timers: [],
+  me: null, // {role: 'admin' | 'viewer', user}
 };
+const isAdmin = () => state.me?.role === 'admin';
 const MAX_LOGS = 3000;
 const NOISE = /RCON (Listener|Client)|Thread RCON/;
 
@@ -84,13 +86,13 @@ function showLogin() {
   closeAiStream();
   $('#app-view').classList.add('hidden');
   $('#login-view').classList.remove('hidden');
-  $('#password').focus();
+  ($('#username').value ? $('#password') : $('#username')).focus();
 }
 $('#login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   $('#login-error').textContent = '';
   try {
-    await api('/api/login', { method: 'POST', body: { password: $('#password').value } });
+    await api('/api/login', { method: 'POST', body: { username: $('#username').value.trim(), password: $('#password').value } });
     $('#password').value = '';
     boot();
   } catch (err) { $('#login-error').textContent = err.message; }
@@ -101,6 +103,11 @@ $('#logout-btn').addEventListener('click', async () => { await api('/api/logout'
 async function boot() {
   $('#login-view').classList.add('hidden');
   $('#app-view').classList.remove('hidden');
+  state.me = await api('/api/me');
+  document.body.classList.toggle('viewer', !isAdmin());
+  $('#users-btn').classList.toggle('hidden', !isAdmin());
+  $('#role-chip').classList.toggle('hidden', isAdmin());
+  $('#role-chip').replaceChildren('👁 View only · ', el('b', {}, state.me.user || ''));
   state.config = await api('/api/config');
   const [name, tab] = decodeURIComponent(location.hash.slice(1)).split('/');
   await refreshServers();
@@ -164,7 +171,7 @@ function tickUptime() {
 function renderSidebar() {
   const list = $('#server-list');
   if (!state.servers.length) {
-    list.replaceChildren(el('div', { class: 'side-empty' }, 'Koi server nahi. "+ New" dabao!'));
+    list.replaceChildren(el('div', { class: 'side-empty' }, isAdmin() ? 'Koi server nahi. "+ New" dabao!' : 'Abhi koi server nahi.'));
     return;
   }
   list.replaceChildren(...state.servers.map((s) => {
@@ -181,6 +188,7 @@ function select(name, tab) {
   const changed = name !== state.selected;
   state.selected = name;
   if (tab) state.tab = tab;
+  if (state.tab === 'settings' && !isAdmin()) state.tab = 'overview';
   if (changed) {
     state.logs = [];
     state.hist = { cpu: [], mem: [] };
@@ -211,10 +219,10 @@ function renderMain() {
       el('div', { class: 'block' }),
       el('h1', {}, 'Welcome to CraftPanel'),
       el('p', {}, 'Apna pehla Minecraft server banao — naam do, difficulty chuno, players set karo, aur 2 minute mein dosto ke saath khelo.'),
-      el('button', { class: 'mc-btn green', style: 'padding:12px 22px;font-size:15px', onclick: () => openCreate() }, '+ Create your first server')));
+      isAdmin() ? el('button', { class: 'mc-btn green', style: 'padding:12px 22px;font-size:15px', onclick: () => openCreate() }, '+ Create your first server') : null));
     return;
   }
-  const tabs = [['overview', '📊 Overview'], ['console', '⌨ Console'], ['players', '👥 Players'], ['ai', '🤖 AI'], ['backups', '💾 Backups'], ['settings', '⚙ Settings']];
+  const tabs = [['overview', '📊 Overview'], ['console', '⌨ Console'], ['players', '👥 Players'], ['ai', '🤖 AI'], ['backups', '💾 Backups'], ['settings', '⚙ Settings']].filter(([id]) => id !== 'settings' || isAdmin());
   main.replaceChildren(
     renderHero(s),
     el('div', { class: 'tabs' }, tabs.map(([id, label]) => el('button', {
@@ -255,7 +263,7 @@ function updateLive() {
   if (pill) { pill.className = `pill ${cls}`; pill.replaceChildren(el('span', { class: `dot ${cls}` }), label); }
   const motd = $('#hero-motd'); if (motd) motd.textContent = s.motd;
   const actions = $('#hero-actions');
-  if (actions && actions.dataset.state !== s.state + busyKey()) {
+  if (actions && isAdmin() && actions.dataset.state !== s.state + busyKey()) {
     actions.dataset.state = s.state + busyKey();
     const running = s.state === 'running';
     const busy = state.busy === s.name;
@@ -402,10 +410,10 @@ function renderConsoleTab() {
       el('button', { class: 'mc-btn ghost small', onclick: downloadLogs }, '⬇ Download'),
       el('button', { class: 'mc-btn ghost small', onclick: () => { state.logs = []; paintConsoles(); } }, '🧹 Clear view')),
     el('div', { class: 'console full' }),
-    el('form', { class: 'cmd-row', onsubmit: sendCmd },
+    !isAdmin() ? el('p', { class: 'muted', style: 'font-size:12px' }, '👁 View-only account: commands sirf admin chala sakta hai.') : el('form', { class: 'cmd-row', onsubmit: sendCmd },
       el('div', { class: 'prompt' }, el('span', {}, '/'), input),
       el('button', { class: 'mc-btn green', type: 'submit' }, 'Send ↵')),
-    el('div', { class: 'quick' }, quick.map(([label, cmd]) => el('button', { type: 'button', onclick: () => runCmd(cmd) }, label))));
+    isAdmin() && el('div', { class: 'quick' }, quick.map(([label, cmd]) => el('button', { type: 'button', onclick: () => runCmd(cmd) }, label))));
 }
 
 function classify(line) {
@@ -509,6 +517,7 @@ function renderPlayersTab(s) {
     ? names.map((n) => el('span', { class: 'pill', style: 'padding:3px 10px 3px 3px' }, el('img', { src: headUrl(n), width: 20, height: 20, style: 'border-radius:3px', onerror: (e) => { e.target.src = headUrl('MHF_Steve'); } }), n))
     : [el('span', { class: 'muted' }, 'Koi nahi')];
   const quickForm = (placeholder, btn, cmdFn) => {
+    if (!isAdmin()) return null;
     const input = el('input', { placeholder, maxlength: 16 });
     return el('form', { class: 'inline-form', onsubmit: (e) => { e.preventDefault(); const n = input.value.trim(); if (!n) return; runCmd(cmdFn(n), true); input.value = ''; } },
       input, el('button', { class: 'mc-btn green', type: 'submit' }, btn));
@@ -521,7 +530,7 @@ function renderPlayersTab(s) {
         el('div', { class: 'card-title' }, `📜 Whitelist ${s.whitelistEnabled ? '(ON)' : '(OFF)'}`),
         el('div', { style: 'display:flex;gap:6px;flex-wrap:wrap' }, chips(list(s.whitelist))),
         quickForm('Player name', '+ Whitelist', (n) => `whitelist add ${n}`),
-        el('p', { class: 'muted', style: 'font-size:12px;margin:8px 0 0' }, 'Permanent list ke liye Settings → Whitelist players mein bhi naam daal do.')),
+        isAdmin() && el('p', { class: 'muted', style: 'font-size:12px;margin:8px 0 0' }, 'Permanent list ke liye Settings → Whitelist players mein bhi naam daal do.')),
       el('div', { class: 'card' },
         el('div', { class: 'card-title' }, '👑 Operators (admins)'),
         el('div', { style: 'display:flex;gap:6px;flex-wrap:wrap' }, chips(list(s.ops))),
@@ -545,7 +554,7 @@ function playerCards(s) {
       el('img', { src: headUrl(n), alt: n, onerror: (e) => { e.target.src = headUrl('MHF_Steve'); } }),
       el('div', { style: 'min-width:0' },
         el('div', { class: 'pname' }, n),
-        el('div', { class: 'acts' },
+        isAdmin() && el('div', { class: 'acts' },
           act('OP', `op ${n}`), act('De-OP', `deop ${n}`),
           act('Creative', `gamemode creative ${n}`), act('Survival', `gamemode survival ${n}`),
           act('Heal', `effect give ${n} minecraft:instant_health 1 10`),
@@ -576,6 +585,8 @@ const FIELDS = [
   { section: '🌍 World (sirf naye world par lagta hai)' },
   { key: 'seed', label: 'Seed', type: 'text', hint: 'Khaali = random' },
   { key: 'levelType', label: 'World type', type: 'select', enum: 'levelType' },
+  { section: '⚡ Performance' },
+  { key: 'aikarFlags', label: 'Smooth mode (Aikar\'s flags)', type: 'check', full: true, hint: 'Java ki memory-safai ke 1–2 second wale atkav kam karta hai. ON rakho' },
   { section: '🔐 Players & Access' },
   { key: 'onlineMode', label: 'Premium accounts only', type: 'check', full: true, hint: 'OFF = TLauncher / cracked / koi bhi naam. ON = sirf paid Microsoft accounts.' },
   { key: 'whitelistEnabled', label: 'Whitelist ON', type: 'check', full: true, hint: 'Sirf list wale players join kar sakte hain' },
@@ -679,7 +690,7 @@ async function loadAi(s, withForm) {
   if (state.selected !== s.name || state.tab !== 'ai') return;
   state.ai = d;
   paintAiStatus(s, d);
-  if (withForm) $('#ai-form-wrap')?.replaceChildren(aiForm(s, d));
+  if (withForm && isAdmin()) $('#ai-form-wrap')?.replaceChildren(aiForm(s, d));
 }
 
 function paintAiStatus(s, d) {
@@ -717,7 +728,7 @@ function paintAiStatus(s, d) {
           el('span', { class: `pill ${cls}` }, el('span', { class: `dot ${cls}` }), label)),
         el('div', { class: 'muted', style: 'font-size:12.5px;margin-top:4px' },
           `${d.config.model} · ${quota}${d.restarts ? ` · restarts: ${d.restarts}` : ''}`)),
-      el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' },
+      isAdmin() && el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' },
         running
           ? act('/stop', '■ AI agents stopped', '■ Stop AI', 'red')
           : act('/start', '🤖 AI agents aa rahe hain! (pehle world ka backup liya gaya)', '▶ Start AI', 'green'),
@@ -859,7 +870,7 @@ function renderBackupsTab(s) {
         el('div', { class: 'muted', style: 'font-size:13px' }, b.intervalHours
           ? `Auto backup har ${b.intervalHours} ghante (jab server chal raha ho) · settings change / regenerate / restore se pehle bhi · last ${b.keep} rakhe jaate hain`
           : `Auto backup OFF (.env mein BACKUP_INTERVAL_HOURS) · settings change / regenerate / restore se pehle backup hota hai`)),
-      btn),
+      isAdmin() ? btn : null),
     el('div', { class: 'card' }, el('div', { class: 'card-title' }, 'Saved backups'), list));
 }
 
@@ -876,12 +887,13 @@ async function loadBackups(s) {
     el('div', { class: 'grow' },
       el('div', { style: 'font-weight:600' }, new Date(bk.createdAt).toLocaleString()),
       el('div', { class: 'muted', style: 'font-size:12px' }, `${REASON_LABEL[bk.reason] || bk.reason} · ${fmtBytes(bk.size)}`)),
+    ...(!isAdmin() ? [] : [
     el('button', { class: 'mc-btn blue small', onclick: () => openRestore(s, bk) }, '↩ Restore'),
     el('a', { class: 'mc-btn ghost small', href: `/api/servers/${encodeURIComponent(s.name)}/backups/${encodeURIComponent(bk.file)}/download`, title: 'Download' }, '⬇'),
     el('button', { class: 'mc-btn ghost small', title: 'Delete', onclick: () => confirmModal('Backup delete karein?', `${new Date(bk.createdAt).toLocaleString()} wala backup hamesha ke liye delete ho jayega.`, 'Delete', async () => {
       try { await api(`/api/servers/${s.name}/backups/${encodeURIComponent(bk.file)}`, { method: 'DELETE' }); toast('🗑 Backup deleted'); } catch (err) { toast(err.message, true); }
       loadBackups(s);
-    }) }, '🗑'))));
+    }) }, '🗑')]))));
 }
 
 function openRestore(s, bk) {
@@ -979,6 +991,52 @@ function openCreate() {
   setTimeout(() => $('input[name=name]', form)?.focus(), 50);
 }
 $('#new-btn').addEventListener('click', openCreate);
+
+/* ---------- view-only accounts (admin) ---------- */
+$('#users-btn').addEventListener('click', openUsers);
+function openUsers() {
+  const nameIn = el('input', { placeholder: 'Username (e.g. rahul)', maxlength: 20, autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false' });
+  const pwIn = el('input', { type: 'text', placeholder: 'Password (kam se kam 6)', maxlength: 200, autocomplete: 'off', 'data-lpignore': 'true' });
+  const list = el('div', { style: 'display:grid;gap:8px;margin:10px 0 16px' }, el('span', { class: 'muted' }, 'Loading…'));
+  const load = async () => {
+    let users;
+    try { users = await api('/api/users'); } catch (err) { list.replaceChildren(el('span', { class: 'error' }, err.message)); return; }
+    list.replaceChildren(...(users.length ? users.map((u) => el('div', { class: 'backup-row' },
+      el('div', { class: 'grow' }, el('div', { style: 'font-weight:600' }, '👁 ', u.username),
+        el('div', { class: 'muted', style: 'font-size:12px' }, 'Banaya: ' + new Date(u.createdAt).toLocaleString())),
+      el('button', { class: 'mc-btn ghost small', type: 'button', title: 'Password badlo', onclick: () => { nameIn.value = u.username; pwIn.focus(); } }, '🔑'),
+      el('button', { class: 'mc-btn ghost small', type: 'button', title: 'Delete', onclick: async () => {
+        try { await api('/api/users/' + encodeURIComponent(u.username), { method: 'DELETE' }); toast('🗑 ' + u.username + ' hata diya'); } catch (err) { toast(err.message, true); }
+        load();
+      } }, '🗑')))
+      : [el('span', { class: 'muted' }, 'Abhi koi viewer nahi.')]));
+  };
+  const err = el('p', { class: 'error' });
+  const btn = el('button', { class: 'mc-btn green', type: 'submit' }, '+ Save');
+  openModal([
+    el('h2', {}, '👥 View-only accounts'),
+    el('p', { class: 'muted', style: 'margin:0' }, 'Dost sab kuch dekh sakte hain (status, console logs, players, AI, backups list) lekin kuch badal nahi sakte. Players ke IP address unhe nahi dikhte.'),
+    list,
+    el('form', { onsubmit: async (e) => {
+      e.preventDefault();
+      err.textContent = '';
+      btn.disabled = true;
+      const name = nameIn.value.trim().toLowerCase();
+      try {
+        const r = await api('/api/users', { method: 'POST', body: { username: name, password: pwIn.value } });
+        toast(r.created ? '✅ ' + name + ' ban gaya. Username + password dost ko bhej do' : '🔑 ' + name + ' ka password badal diya (purane logins logout ho gaye)');
+        nameIn.value = ''; pwIn.value = '';
+        load();
+      } catch (ex) { err.textContent = ex.message; }
+      btn.disabled = false;
+    } },
+    el('div', { class: 'card-title', style: 'margin-bottom:8px' }, 'Naya viewer / password badlo'),
+    el('div', { class: 'inline-form', style: 'margin:0' }, nameIn, pwIn, btn), err),
+    el('div', { class: 'modal-actions' }, el('button', { class: 'mc-btn ghost', type: 'button', onclick: closeModal }, 'Close')),
+  ], true);
+  load();
+  setTimeout(() => nameIn.focus(), 50);
+}
 
 function openDelete(s) {
   const nameInput = el('input', { placeholder: s.name, autocomplete: 'off' });

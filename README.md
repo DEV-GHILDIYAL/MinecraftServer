@@ -63,6 +63,16 @@ End mein panel ka URL aur password print hoga. Password badalna ho to `.env` mei
   ⚠️ Is mode mein koi bhi kisi ka naam use kar sakta hai, isliye **Whitelist ON** karna aur ops kam rakhna safe hai.
 - **ON** — sirf official paid Minecraft Java account (Microsoft login) wale join kar sakte hain.
 
+## 👁 Dosto ke liye view-only login
+
+Admin password kisi ko mat do. Uski jagah har dost ke liye alag ID/password banao:
+1. Admin se login karo → upar **👥 Users** → username + password → **+ Save**
+2. Dost login page par wahi username + password daale (admin khud username khaali chhod ke ya `admin` likh ke login kare)
+
+View-only wale status, console logs, players, AI activity aur backups ki list dekh sakte hain, lekin start/stop,
+commands, settings, backup restore/download kuch nahi kar sakte. Players ke IP address unhe `x.x.x.x` dikhte hain.
+🔑 se password badlo ya 🗑 se hatao: us dost ka login turant band ho jata hai.
+
 ## Useful commands (EC2 par)
 
 ```bash
@@ -97,6 +107,16 @@ docker compose --profile ai build ai-agents     # AI image banao (5–10 min)
 - **Free tier:** Gemini free key ki daily limit kam hoti hai. Limit khatam hote hi agents ruk jaate hain aur agle din
   (1:30 PM IST ke baad) apne aap phir chalu ho jaate hain. RAM: 3 agents ≈ 1.5 GB extra.
 - AI tab mein live activity aur agents ki aapas ki baatcheet (💬) dikhti hai.
+
+## ⚡ Smooth gameplay (atkav kam karna)
+
+- **Settings → ⚡ Performance → Smooth mode** (Aikar's flags, default ON): Java ki memory-safai (garbage collection) ke
+  1–2 second wale atkav kam karta hai.
+- **View distance 8, Simulation distance 6** rakhoge to chunk ka load kam hoga (khaas kar jab AI agents ghoom rahe hon).
+- Server kitna smooth hai, ye dekhne ke liye har 5 second ka sabse dheema tick (P99, 50ms se kam = smooth):
+  ```bash
+  for i in $(seq 1 24); do docker exec mc-<name> rcon-cli "tick query" | grep -o "P99: [0-9.]*ms"; sleep 5; done
+  ```
 
 ## 💾 Backups & World regenerate
 

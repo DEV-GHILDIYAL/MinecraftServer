@@ -313,3 +313,7 @@ textarea:focus { outline: none; border-color: var(--grass); box-shadow: 0 0 0 3p
 .ai-problems div { font-size: 12.5px; color: var(--gold); background: rgba(255,204,51,.06); border: 1px solid rgba(255,204,51,.25); border-radius: 8px; padding: 7px 10px; }
 .console .ln .who { font-weight: 700; color: var(--amethyst); }
 .console .ln.dm { color: var(--diamond); }
+
+/* view-only accounts */
+body.viewer #new-btn { display: none; }
+.role-chip { color: var(--diamond); white-space: nowrap; }

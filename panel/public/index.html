@@ -17,7 +17,8 @@
     <form id="login-form" class="login-card">
       <div class="logo big"><span class="block"></span><span>CraftPanel</span></div>
       <p class="muted">Apne Minecraft servers manage karo</p>
-      <input type="password" id="password" placeholder="Admin password" autocomplete="current-password" required>
+      <input type="text" id="username" placeholder="Username (admin ke liye khaali chhodo)" autocomplete="username" autocapitalize="off" spellcheck="false" maxlength="20">
+      <input type="password" id="password" placeholder="Password" autocomplete="current-password" required>
       <button class="mc-btn green wide" type="submit">▶ Login</button>
       <p id="login-error" class="error"></p>
     </form>
@@ -28,6 +29,8 @@
     <header class="topbar">
       <div class="logo"><span class="block"></span><span>CraftPanel</span></div>
       <div class="host-stats" id="host-stats"></div>
+      <span class="chip role-chip hidden" id="role-chip"></span>
+      <button class="mc-btn ghost small hidden" id="users-btn" title="View-only accounts">👥 Users</button>
       <button class="icon-btn" id="logout-btn" title="Logout">⏻</button>
     </header>
 

@@ -42,22 +42,48 @@ function saveServers(s) {
 }
 let servers = loadServers();
 
+// ---------- Viewer accounts (data/users.json, 0600) ----------
+// Viewers can see everything the admin sees (status, logs, players, AI activity, backup list) but change nothing.
+// Passwords are scrypt-hashed. `ver` is rotated on password reset / delete so old sessions stop working.
+const USERS_FILE = path.join(__dirname, 'data', 'users.json');
+const USER_RE = /^[a-z0-9_-]{3,20}$/;
+const MAX_USERS = 50;
+let users = (() => { try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch { return {}; } })();
+function saveUsers() {
+  fs.mkdirSync(path.dirname(USERS_FILE), { recursive: true });
+  fs.writeFileSync(USERS_FILE + '.tmp', JSON.stringify(users, null, 2), { mode: 0o600 });
+  fs.renameSync(USERS_FILE + '.tmp', USERS_FILE);
+}
+const hashPw = (pw, salt) => crypto.scryptSync(String(pw), salt, 64);
+const DUMMY_SALT = crypto.randomBytes(16).toString('hex');
+function checkViewer(username, password) {
+  const u = Object.prototype.hasOwnProperty.call(users, username) ? users[username] : null;
+  const got = hashPw(password, u ? u.salt : DUMMY_SALT); // same work for unknown users (no timing hint)
+  return !!u && crypto.timingSafeEqual(got, Buffer.from(u.hash, 'hex'));
+}
+
 // ---------- Auth ----------
 const sign = (v) => crypto.createHmac('sha256', SESSION_SECRET).update(v).digest('hex');
 const sha = (v) => crypto.createHash('sha256').update(String(v)).digest();
-function makeToken() {
-  const exp = String(Date.now() + 7 * 24 * 3600 * 1000);
-  return exp + '.' + sign(exp);
+const ADMIN_VER = sign('admin-ver:' + ADMIN_PASSWORD).slice(0, 16); // changing ADMIN_PASSWORD logs out old admin sessions
+// token = <exp>.<role>.<user>.<ver>.<hmac>; usernames never contain dots (USER_RE)
+function makeToken(role, user, ver) {
+  const body = [Date.now() + 7 * 24 * 3600 * 1000, role, user, ver].join('.');
+  return body + '.' + sign(body);
 }
-function validToken(t) {
-  if (!t) return false;
-  const [exp, sig] = t.split('.');
-  if (!exp || !sig) return false;
-  const expected = sign(exp);
-  if (sig.length !== expected.length) return false;
-  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return false;
-  return Number(exp) > Date.now();
+function readToken(t) {
+  if (!t) return null;
+  const parts = t.split('.');
+  if (parts.length !== 5) return null;
+  const [exp, role, user, ver, sig] = parts;
+  const expected = sign(parts.slice(0, 4).join('.'));
+  if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  if (!(Number(exp) > Date.now())) return null;
+  if (role === 'admin' && user === 'admin' && ver === ADMIN_VER) return { role, user };
+  if (role === 'viewer' && Object.prototype.hasOwnProperty.call(users, user) && users[user].ver === ver) return { role, user };
+  return null; // user deleted / password reset / admin password changed
 }
+const sessionOf = (req) => readToken(getCookie(req, 'session'));
 function getCookie(req, name) {
   for (const part of (req.headers.cookie || '').split(';')) {
     const i = part.indexOf('=');
@@ -71,24 +97,67 @@ app.post('/api/login', (req, res) => {
   const ip = req.socket.remoteAddress;
   const f = failed.get(ip);
   if (f && f.until > Date.now()) return res.status(429).json({ error: 'Too many attempts. Try again in 10 minutes.' });
-  const ok = crypto.timingSafeEqual(sha(req.body?.password || ''), sha(ADMIN_PASSWORD));
-  if (!ok) {
+  const username = String(req.body?.username || '').trim().toLowerCase();
+  const password = String(req.body?.password || '');
+  let token = null;
+  if (!username || username === 'admin') { // blank username = admin (old one-password login keeps working)
+    if (crypto.timingSafeEqual(sha(password), sha(ADMIN_PASSWORD))) token = makeToken('admin', 'admin', ADMIN_VER);
+  } else if (USER_RE.test(username) && password.length <= 200 && checkViewer(username, password)) {
+    token = makeToken('viewer', username, users[username].ver);
+  }
+  if (!token) {
     const n = (f && f.until <= Date.now() && f.count >= 10 ? 0 : f?.count || 0) + 1;
     failed.set(ip, { count: n, until: n >= 10 ? Date.now() + 10 * 60 * 1000 : 0 });
-    return res.status(401).json({ error: 'Wrong password' });
+    return res.status(401).json({ error: 'Wrong username or password' });
   }
   failed.delete(ip);
-  res.setHeader('Set-Cookie', `session=${makeToken()}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${7 * 24 * 3600}`);
+  res.setHeader('Set-Cookie', `session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${7 * 24 * 3600}`);
   res.json({ ok: true });
 });
 app.post('/api/logout', (req, res) => {
   res.setHeader('Set-Cookie', 'session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
   res.json({ ok: true });
 });
-app.get('/api/me', (req, res) => res.json({ loggedIn: validToken(getCookie(req, 'session')) }));
+app.get('/api/me', (req, res) => {
+  const ses = sessionOf(req);
+  res.json(ses ? { loggedIn: true, role: ses.role, user: ses.user } : { loggedIn: false });
+});
+// The only routes a viewer may call: read-only GETs. An allowlist, so new routes are admin-only by default.
+// Case-insensitive + optional trailing slash because Express routing matches those too.
+// Not listed on purpose: backup downloads (whole world files) and /users.
+const VIEWER_GET = /^\/(config|host|servers|servers\/[^/]+\/(logs|logs\/stream|stats|backups|ai|ai\/logs\/stream))\/?$/i;
 app.use('/api', (req, res, next) => {
-  if (!validToken(getCookie(req, 'session'))) return res.status(401).json({ error: 'Not logged in' });
+  const ses = sessionOf(req);
+  if (!ses) return res.status(401).json({ error: 'Not logged in' });
+  req.session = ses;
+  if (ses.role !== 'admin' && !(req.method === 'GET' && VIEWER_GET.test(req.path))) {
+    return res.status(403).json({ error: 'View-only account: ye kaam sirf admin kar sakta hai' });
+  }
   next();
+});
+
+// ---------- Viewer account management (admin only; enforced above) ----------
+app.get('/api/users', (req, res) => {
+  res.json(Object.entries(users).map(([username, u]) => ({ username, createdAt: u.createdAt })));
+});
+// create, or reset the password of an existing viewer (which logs them out everywhere)
+app.post('/api/users', (req, res) => {
+  const username = String(req.body?.username || '').trim().toLowerCase();
+  const password = String(req.body?.password || '');
+  if (!USER_RE.test(username) || username === 'admin') return res.status(400).json({ error: 'Username: 3–20 chars, a-z 0-9 _ - ("admin" nahi)' });
+  if (password.length < 6 || password.length > 200) return res.status(400).json({ error: 'Password kam se kam 6 characters' });
+  const exists = Object.prototype.hasOwnProperty.call(users, username);
+  if (!exists && Object.keys(users).length >= MAX_USERS) return res.status(400).json({ error: `Max ${MAX_USERS} viewers` });
+  const salt = crypto.randomBytes(16).toString('hex');
+  users[username] = { salt, hash: hashPw(password, salt).toString('hex'), ver: crypto.randomBytes(8).toString('hex'), createdAt: exists ? users[username].createdAt : new Date().toISOString() };
+  saveUsers();
+  res.json({ ok: true, created: !exists });
+});
+app.delete('/api/users/:u', (req, res) => {
+  if (!Object.prototype.hasOwnProperty.call(users, req.params.u)) return res.status(404).json({ error: 'User not found' });
+  delete users[req.params.u];
+  saveUsers();
+  res.json({ ok: true });
 });
 
 // ---------- Settings validation ----------
@@ -98,6 +167,7 @@ const DEFAULTS = {
   allowFlight: false, commandBlocks: true, viewDistance: 10, simulationDistance: 10,
   spawnProtection: 16, memory: '2G', seed: '', levelType: 'minecraft:normal',
   whitelistEnabled: false, whitelist: '', ops: '',
+  aikarFlags: true, // tuned G1GC JVM flags: shorter garbage-collection pauses (the usual cause of 1-2 s stutters)
 };
 const ENUMS = {
   type: ['VANILLA', 'PAPER', 'PURPUR', 'FABRIC', 'FORGE'],
@@ -128,7 +198,7 @@ function sanitize(input, base) {
   int('viewDistance', 3, 32);
   int('simulationDistance', 3, 32);
   int('spawnProtection', 0, 100);
-  for (const k of ['onlineMode', 'pvp', 'hardcore', 'allowFlight', 'commandBlocks', 'whitelistEnabled']) {
+  for (const k of ['onlineMode', 'pvp', 'hardcore', 'allowFlight', 'commandBlocks', 'whitelistEnabled', 'aikarFlags']) {
     if (has(k)) s[k] = input[k] === true || input[k] === 'true';
   }
   if (has('version')) {
@@ -172,6 +242,7 @@ function buildEnv(s) {
     SIMULATION_DISTANCE: s.simulationDistance, SPAWN_PROTECTION: s.spawnProtection,
     MEMORY: s.memory, LEVEL_TYPE: s.levelType,
     ENABLE_WHITELIST: s.whitelistEnabled, ENFORCE_WHITELIST: s.whitelistEnabled,
+    USE_AIKAR_FLAGS: s.aikarFlags,
   };
   if (s.seed) env.SEED = s.seed;
   if (s.whitelist) env.WHITELIST = s.whitelist;
@@ -638,7 +709,8 @@ app.get('/api/servers/:name/logs', wrap(async (req, res) => {
   if (!(await inspect(s.name))) return res.json({ logs: '(container not running)' });
   const tail = Math.min(Math.max(parseInt(req.query.tail, 10) || 300, 10), 2000);
   const buf = await docker.getContainer(cname(s.name)).logs({ stdout: true, stderr: true, tail });
-  res.json({ logs: stripAnsi(buf.toString('utf8')) });
+  const text = stripAnsi(buf.toString('utf8'));
+  res.json({ logs: req.session.role === 'admin' ? text : maskIps(text) });
 }));
 
 // Live logs via Server-Sent Events
@@ -648,8 +720,12 @@ app.get('/api/servers/:name/logs/stream', wrap(async (req, res) => {
   await streamLogs(cname(s.name), !!(await inspect(s.name)), req, res);
 }));
 
+// Viewers don't get players' IP addresses ("Steve[/1.2.3.4:5678] logged in ...")
+const maskIps = (t) => t.replace(/\b\d{1,3}(\.\d{1,3}){3}(:\d+)?\b/g, 'x.x.x.x');
+
 // SSE: `event: reset` first, then one `data: "<line>"` per log line; ends when the container stops
 async function streamLogs(container, exists, req, res) {
+  const view = req.session?.role === 'admin' ? (t) => t : maskIps;
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
   res.write('event: reset\ndata: {}\n\n');
   if (!exists) { res.write('retry: 5000\n\n'); return res.end(); }
@@ -659,7 +735,7 @@ async function streamLogs(container, exists, req, res) {
     buf += chunk.toString('utf8');
     const lines = buf.split('\n');
     buf = lines.pop();
-    for (const l of lines) { const t = stripAnsi(l); if (t.trim()) res.write(`data: ${JSON.stringify(t)}\n\n`); }
+    for (const l of lines) { const t = view(stripAnsi(l)); if (t.trim()) res.write(`data: ${JSON.stringify(t)}\n\n`); }
   });
   const ping = setInterval(() => res.write(': ping\n\n'), 20000);
   const done = () => { clearInterval(ping); stream.destroy?.(); };
