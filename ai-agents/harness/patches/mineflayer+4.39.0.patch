@@ -1,0 +1,118 @@
+diff --git a/node_modules/mineflayer/lib/plugins/digging.js b/node_modules/mineflayer/lib/plugins/digging.js
+--- a/node_modules/mineflayer/lib/plugins/digging.js
++++ b/node_modules/mineflayer/lib/plugins/digging.js
+@@ -244,6 +244,9 @@
+       enchantments = enchantments.concat(helmetEnchantments)
+     }
+ 
++    if (block.material === 'incorrect_for_wooden_tool')
++      block.material = 'mineable/pickaxe'
++
+     const creative = bot.game.gameMode === 'creative'
+     return block.digTime(
+       type,
+diff --git a/node_modules/mineflayer/lib/plugins/entities.js b/node_modules/mineflayer/lib/plugins/entities.js
+--- a/node_modules/mineflayer/lib/plugins/entities.js
++++ b/node_modules/mineflayer/lib/plugins/entities.js
+@@ -31,6 +31,21 @@
+ }
+ 
+ function inject (bot) {
++  // 1.21.9+ (incl. 26.1) send velocity as lpVec3, already in blocks/tick; older versions send 1/8000 block/tick.
++  // Older protocol definitions used flat velocityX/Y/Z fields.
++  const velocityIsLp = {}
++  function velocityFrom (packetName, packet) {
++    if (!packet.velocity) return conv.fromNotchVelocity(new Vec3(packet.velocityX, packet.velocityY, packet.velocityZ))
++    const v = new Vec3(packet.velocity.x, packet.velocity.y, packet.velocity.z)
++    if (!(packetName in velocityIsLp)) {
++      let lp = false
++      try {
++        lp = bot.registry.protocol.play.toClient.types['packet_' + packetName][1].some(f => f.name === 'velocity' && f.type === 'lpVec3')
++      } catch (e) {}
++      velocityIsLp[packetName] = lp
++    }
++    return velocityIsLp[packetName] ? v : conv.fromNotchVelocity(v)
++  }
+   const { mobs } = bot.registry
+   const Entity = require('prismarine-entity')(bot.version)
+   const Item = require('prismarine-item')(bot.version)
+@@ -232,7 +247,7 @@
+       : addNewNonPlayer(packet.entityId, packet.objectUUID, packet.type, packet)
+     // 1.8 omits velocity when objectData is 0
+     if (packet.velocity) {
+-      entity.velocity.update(conv.fromNotchVelocity(new Vec3(packet.velocity.x, packet.velocity.y, packet.velocity.z)))
++      entity.velocity.update(velocityFrom('spawn_entity', packet))
+     }
+     bot.emit('entitySpawn', entity)
+   })
+@@ -275,8 +290,7 @@
+     entity.yaw = conv.fromNotchianYawByte(packet.yaw)
+     entity.pitch = conv.fromNotchianPitchByte(packet.pitch)
+     entity.headPitch = conv.fromNotchianPitchByte(packet.headPitch)
+-    const notchVel = new Vec3(packet.velocity.x, packet.velocity.y, packet.velocity.z)
+-    entity.velocity.update(conv.fromNotchVelocity(notchVel))
++    entity.velocity.update(velocityFrom('spawn_entity_living', packet))
+     entity.metadata = parseMetadata(packet.metadata, entity.metadata)
+ 
+     bot.emit('entitySpawn', entity)
+@@ -285,8 +299,7 @@
+   bot._client.on('entity_velocity', (packet) => {
+     // entity velocity
+     const entity = fetchEntity(packet.entityId)
+-    const notchVel = new Vec3(packet.velocity.x, packet.velocity.y, packet.velocity.z)
+-    entity.velocity.update(conv.fromNotchVelocity(notchVel))
++    entity.velocity.update(velocityFrom('entity_velocity', packet))
+   })
+ 
+   bot._client.on('entity_destroy', (packet) => {
+diff --git a/node_modules/mineflayer/lib/plugins/inventory.js b/node_modules/mineflayer/lib/plugins/inventory.js
+--- a/node_modules/mineflayer/lib/plugins/inventory.js
++++ b/node_modules/mineflayer/lib/plugins/inventory.js
+@@ -30,9 +30,12 @@
+   let sequence = 0
+ 
+   let nextActionNumber = 0 // < 1.17
+-  let stateId = -1
++  const stateIds = new Map()
+   if (bot.supportFeature('stateIdUsed')) {
+-    const listener = packet => { stateId = packet.stateId }
++    const listener = packet => {
++      const id = packet.windowId === -1 || packet.windowId === -2 ? (bot.currentWindow?.id ?? 0) : packet.windowId
++      stateIds.set(id, packet.stateId)
++    }
+     bot._client.on('window_items', listener)
+     bot._client.on('set_slot', listener)
+   }
+@@ -434,6 +437,7 @@
+     bot._client.write('close_window', {
+       windowId: window.id
+     })
++    if (window.id !== 0) stateIds.delete(window.id)
+     copyInventory(window)
+     lastClosedWindow = window
+     bot.currentWindow = null
+@@ -629,7 +633,7 @@
+     if (bot.supportFeature('stateIdUsed')) { // 1.17.1 +
+       bot._client.write('window_click', {
+         windowId: window.id,
+-        stateId,
++        stateId: stateIds.get(window.id) ?? -1,
+         slot,
+         mouseButton,
+         mode,
+@@ -751,6 +755,7 @@
+   bot._client.on('close_window', (packet) => {
+     // close window
+     const oldWindow = bot.currentWindow
++    if (oldWindow && oldWindow.id !== 0) stateIds.delete(oldWindow.id)
+     bot.currentWindow = null
+     bot.emit('windowClose', oldWindow)
+   })
+@@ -758,6 +763,7 @@
+   // the closed one's id and its early sync must not be taken for a trailing one.
+   bot._client.on('respawn', () => { lastClosedWindow = null })
+   bot._client.on('login', () => {
++    stateIds.clear()
+     lastClosedWindow = null
+     // close window when switch subserver
+     windowItems = null

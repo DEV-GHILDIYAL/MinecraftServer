@@ -227,9 +227,12 @@ async function removeContainer(name) {
 
 const stripAnsi = (t) => t.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\r/g, '');
 
-async function rcon(name, command, timeoutMs = 8000) {
-  const exec = await docker.getContainer(cname(name)).exec({
-    Cmd: ['rcon-cli', command], AttachStdout: true, AttachStderr: true, Tty: true,
+const rcon = (name, command, timeoutMs = 8000) => execText(cname(name), ['rcon-cli', command], timeoutMs);
+
+// Runs an argv (never a shell string) inside a container and returns its output as text
+async function execText(container, cmd, timeoutMs = 8000) {
+  const exec = await docker.getContainer(container).exec({
+    Cmd: cmd, AttachStdout: true, AttachStderr: true, Tty: true,
   });
   const stream = await exec.start({ hijack: true, stdin: false, Tty: true });
   return new Promise((resolve, reject) => {
@@ -260,7 +263,7 @@ async function status(s) {
 
 // ---------- Backups ----------
 // File: backups/<server>/<YYYY-MM-DD_HH-MM-SS>_<reason>.tgz (UTC) + same name .json with a settings snapshot
-const REASONS = ['auto', 'manual', 'settings', 'regenerate', 'restore'];
+const REASONS = ['auto', 'manual', 'settings', 'regenerate', 'restore', 'ai'];
 const BACKUP_RE = new RegExp(`^(\\d{4}-\\d{2}-\\d{2})_(\\d{2})-(\\d{2})-(\\d{2})_(${REASONS.join('|')})\\.tgz$`);
 const TAR_EXCLUDES = ['./libraries', './versions', './cache', './.cache', './logs', './crash-reports'].map((p) => `--exclude=${p}`);
 const WORLD_DIRS = ['/data/world', '/data/world_nether', '/data/world_the_end'];
@@ -359,6 +362,183 @@ const REGEN_SCRIPT = `rm -rf ${WORLD_DIRS.join(' ')} && { [ ! -f /data/server.pr
 // Wipes /data (except re-downloadable server files) and unpacks the backup given as $1
 const RESTORE_SCRIPT = 'find /data -mindepth 1 -maxdepth 1 ! -name libraries ! -name versions ! -name cache -exec rm -rf {} + && tar xzf "$1" -C /data';
 
+// ---------- AI agents (ai-agents/ image, one container per Minecraft server) ----------
+// Container mc-<name>-ai runs minecraft-agent-harness with N agents that join as normal offline-mode survival
+// players. They never get OP, a shell, docker.sock or RCON; the harness itself refuses slash commands.
+const AI_IMAGE = 'craftpanel-ai-agents:latest';
+// The harness runs on mineflayer 4.39 (ai-agents/harness), which speaks protocol 775 = Minecraft 26.1, 26.1.1 and 26.1.2.
+// Maps a server version to the protocol name mineflayer expects, or null if the agents can't join it.
+const AI_SUPPORTED = '26.1.x';
+const aiProtocolFor = (version) => (/^26\.1(\.[0-2])?$/.test(String(version)) ? '26.1' : null);
+const AI_KEYS_FILE = path.join(__dirname, 'data', 'ai-keys.json'); // kept out of servers.json so it never reaches the browser or backups
+const AI_PROVIDERS = {
+  google: 'GEMINI_API_KEY', openai: 'OPENAI_API_KEY', anthropic: 'ANTHROPIC_API_KEY', openrouter: 'OPENROUTER_API_KEY',
+  groq: 'GROQ_API_KEY', mistral: 'MISTRAL_API_KEY', deepseek: 'DEEPSEEK_API_KEY',
+};
+const AI_MODEL_RE = new RegExp(`^(${Object.keys(AI_PROVIDERS).join('|')})/[A-Za-z0-9._:~/-]{1,100}$`);
+const AI_THINKING = ['off', 'minimal', 'low', 'medium', 'high'];
+const AI_OBJECTIVE = [
+  'You are one of a small group of AI players living together in a Minecraft survival world. Your companions: {peers}.',
+  'There is no fixed task. Live like real human players do: survive your first nights, gather wood and stone, craft better tools and armor,',
+  'find food and start farms, mine for iron and diamonds, build houses and grow a little village into a civilization.',
+  'Talk to your companions often with DMs: introduce yourself, share discoveries, divide work, help anyone in trouble,',
+  'and agree on your own rules, roles and plans as a group. Write your plans and the group rules in your notes so you remember them.',
+  'Respect the world, because human players share it: never grief, never break or loot builds, farms or chests you did not make,',
+  'keep your settlement at least 150 blocks away from world spawn, and never start fires or use TNT or lava near anything built.',
+].join(' ');
+const AI_DEFAULTS = {
+  wanted: false, model: 'google/gemini-flash-lite-latest', thinking: 'low', rpm: 10, dailyCap: 450, objective: AI_OBJECTIVE,
+  agents: [
+    { name: 'Aarav', personality: 'A builder at heart: designs sturdy, good-looking houses and keeps the village tidy.' },
+    { name: 'Meera', personality: 'A brave, curious explorer and miner who goes caving for iron and diamonds and shares what she finds.' },
+    { name: 'Kabir', personality: 'A calm farmer and planner who keeps everyone fed, writes down the group rules and settles arguments.' },
+  ],
+};
+const aiCname = (name) => `mc-${name}-ai`;
+const aiVolume = (name) => `mc-${name}-ai-state`;
+const aiOf = (s) => ({ ...AI_DEFAULTS, ...(s.ai || {}) });
+
+let aiKeys = {};
+try { aiKeys = JSON.parse(fs.readFileSync(AI_KEYS_FILE, 'utf8')); } catch {}
+function saveAiKeys() {
+  fs.mkdirSync(path.dirname(AI_KEYS_FILE), { recursive: true });
+  fs.writeFileSync(AI_KEYS_FILE + '.tmp', JSON.stringify(aiKeys), { mode: 0o600 });
+  fs.renameSync(AI_KEYS_FILE + '.tmp', AI_KEYS_FILE);
+}
+
+function sanitizeAi(input, base) {
+  const a = { ...base };
+  const has = (k) => input[k] !== undefined && input[k] !== null;
+  if (has('model')) {
+    const m = String(input.model).trim();
+    if (!AI_MODEL_RE.test(m)) throw new BadRequest(`Model must look like provider/model-id (providers: ${Object.keys(AI_PROVIDERS).join(', ')})`);
+    a.model = m;
+  }
+  if (has('thinking')) {
+    if (!AI_THINKING.includes(input.thinking)) throw new BadRequest('Invalid thinking level');
+    a.thinking = input.thinking;
+  }
+  const int = (k, min, max) => {
+    if (!has(k)) return;
+    const n = parseInt(input[k], 10);
+    if (Number.isNaN(n) || n < min || n > max) throw new BadRequest(`${k} must be between ${min} and ${max}`);
+    a[k] = n;
+  };
+  int('rpm', 1, 120);
+  int('dailyCap', 0, 1000000);
+  if (has('objective')) {
+    a.objective = String(input.objective).replace(/[\x00-\x09\x0b-\x1f\x7f]/g, ' ').slice(0, 3000).trim();
+    if (!a.objective) throw new BadRequest('Objective cannot be empty');
+  }
+  if (has('agents')) {
+    if (!Array.isArray(input.agents) || input.agents.length < 1 || input.agents.length > 5) throw new BadRequest('1 to 5 agents allowed');
+    const seen = new Set();
+    a.agents = input.agents.map((g) => {
+      const name = String(g?.name || '').trim();
+      if (!PLAYER_RE.test(name)) throw new BadRequest(`Invalid agent name: ${name.slice(0, 20) || '(empty)'} (3-16 letters, digits, _)`);
+      if (name.length < 3) throw new BadRequest(`Agent name too short: ${name}`);
+      if (seen.has(name.toLowerCase())) throw new BadRequest(`Duplicate agent name: ${name}`);
+      seen.add(name.toLowerCase());
+      return { name, personality: String(g?.personality || '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 400).trim() };
+    });
+  }
+  return a;
+}
+
+async function aiImageReady() {
+  try { await docker.getImage(AI_IMAGE).inspect(); return true; } catch { return false; }
+}
+async function aiInspect(name) {
+  try { return await docker.getContainer(aiCname(name)).inspect(); } catch (e) {
+    if (e.statusCode === 404) return null;
+    throw e;
+  }
+}
+async function removeAi(name) {
+  const info = await aiInspect(name);
+  if (!info) return;
+  const c = docker.getContainer(aiCname(name));
+  if (info.State.Running) await c.stop({ t: 20 }).catch(() => {});
+  await c.remove({ force: true }).catch(() => {});
+}
+
+// Everything that must be true before agents may join. Returns a list of human-readable problems.
+async function aiProblems(s, { needRunning = true } = {}) {
+  const ai = aiOf(s);
+  const p = [];
+  if (!(await aiImageReady())) p.push('AI image abhi bana nahi hai. EC2 par chalao: docker compose --profile ai build ai-agents');
+  if (!aiKeys[s.name]) p.push('API key save nahi hai');
+  if (!aiProtocolFor(s.version)) {
+    p.push(/^(LATEST|SNAPSHOT)$/.test(s.version)
+      ? `Server version "${s.version}" hai, jo apne aap naye version par upgrade ho jata hai. AI ke liye Settings mein exact version likho jo world abhi chala raha hai (${AI_SUPPORTED}, jaise 26.1.2). Console mein "Starting minecraft server version" wali line dekho. Version kabhi neeche mat karna, world kharab ho sakta hai`
+      : `AI agents sirf Minecraft ${AI_SUPPORTED} par chalte hain (ye server: ${s.version}). Purane world ka version neeche karne se world kharab ho sakta hai`);
+  }
+  if (s.onlineMode) p.push('AI agents cracked (offline) accounts se join karte hain. Settings mein "Premium accounts only" OFF karo');
+  const ops = new Set(String(s.ops || '').split(',').filter(Boolean).map((n) => n.toLowerCase()));
+  for (const g of ai.agents) if (ops.has(g.name.toLowerCase())) p.push(`${g.name} OP list mein hai. AI ko OP dena allowed nahi`);
+  if (needRunning) {
+    const info = await inspect(s.name);
+    if (!info?.State.Running || info.State.Health?.Status !== 'healthy') p.push('Minecraft server Online (green) hona chahiye');
+  }
+  return p;
+}
+
+async function startAi(s) {
+  const ai = aiOf(s);
+  const provider = ai.model.split('/')[0];
+  await removeAi(s.name);
+  // Whitelisted servers: let the agents in (persists in whitelist.json inside the world volume)
+  if (s.whitelistEnabled) for (const g of ai.agents) await rcon(s.name, `whitelist add ${g.name}`, 5000).catch(() => {});
+  const config = {
+    host: 'host.docker.internal', port: s.port, mcVersion: aiProtocolFor(s.version), model: ai.model, thinking: ai.thinking,
+    rpm: ai.rpm, dailyCap: ai.dailyCap, objective: ai.objective, agents: ai.agents,
+  };
+  const mem = (ai.agents.length * 400 + 300) * 1024 * 1024;
+  const c = await docker.createContainer({
+    name: aiCname(s.name),
+    Image: AI_IMAGE,
+    Tty: true, // plain log stream (no 8-byte multiplex headers), same as the Minecraft containers
+    Env: [`AI_CONFIG=${JSON.stringify(config)}`, `${AI_PROVIDERS[provider]}=${aiKeys[s.name]}`, `TZ=${TZ}`],
+    Labels: { 'mcpanel.ai': '1', 'mcpanel.name': s.name },
+    HostConfig: {
+      Binds: [`${aiVolume(s.name)}:/data`], // agent memory (sessions + notes); not the world
+      ExtraHosts: ['host.docker.internal:host-gateway'],
+      RestartPolicy: { Name: 'unless-stopped' },
+      Memory: mem, MemorySwap: mem, NanoCpus: 1500000000, PidsLimit: 512,
+      CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges'],
+    },
+  });
+  await c.start();
+}
+
+// After the server (re)starts, bring the agents back once it is healthy, if the user had them running.
+const aiResuming = new Set();
+function resumeAiWhenHealthy(name) {
+  if (aiResuming.has(name)) return;
+  aiResuming.add(name);
+  const deadline = Date.now() + 10 * 60 * 1000;
+  const tick = async () => {
+    const s = servers[name];
+    try {
+      if (!s || !aiOf(s).wanted || Date.now() > deadline) return aiResuming.delete(name);
+      if (busy.has(name)) return setTimeout(tick, 10000);
+      const info = await inspect(name);
+      if (!info?.State.Running || info.State.Health?.Status !== 'healthy') return setTimeout(tick, 10000);
+      const problems = await aiProblems(s);
+      aiResuming.delete(name);
+      if (problems.length) return console.warn(`AI for ${name} not resumed: ${problems.join('; ')}`);
+      if (busy.has(name)) return resumeAiWhenHealthy(name);
+      busy.add(name);
+      try { await startAi(s); } finally { busy.delete(name); }
+      console.log(`AI agents for ${name} resumed`);
+    } catch (e) {
+      aiResuming.delete(name);
+      console.error(`AI resume ${name}:`, e.message);
+    }
+  };
+  setTimeout(tick, 5000);
+}
+
 // per-server lock so two actions don't race
 const busy = new Set();
 const wrap = (fn) => async (req, res) => {
@@ -416,11 +596,13 @@ app.put('/api/servers/:name', withServer(async (s, req, res) => {
   const changed = Object.keys(updated).some((k) => JSON.stringify(updated[k]) !== JSON.stringify(before[k]));
   if (!changed) return res.json({ ...(await status(s)), unchanged: true }); // nothing to do: no backup, no restart
   await backup(s, 'settings'); // snapshot BEFORE applying new settings; aborts the save if it fails
+  await removeAi(name); // agents rejoin with the new settings (e.g. version) once the server is healthy again
   const wasRunning = await removeContainer(name);
   servers[name] = updated;
   saveServers(servers);
   await createContainer(updated);
   if (!wasRunning) await docker.getContainer(cname(name)).stop({ t: 60 }).catch(() => {});
+  else resumeAiWhenHealthy(name);
   res.json(await status(updated));
 }));
 
@@ -430,12 +612,17 @@ app.post('/api/servers/:name/:action(start|stop|restart)', withServer(async (s, 
   const c = docker.getContainer(cname(s.name));
   const action = req.params.action;
   if (action === 'start' && info && !info.State.Running) await c.start();
+  if (action === 'stop') await removeAi(s.name); // agents leave first; they come back on the next start
   if (action === 'stop' && (!info || info.State.Running)) await c.stop({ t: 60 });
   if (action === 'restart' && info) await c.restart({ t: 60 });
+  if (action !== 'stop') resumeAiWhenHealthy(s.name);
   res.json(await status(s));
 }));
 
 app.delete('/api/servers/:name', withServer(async (s, req, res) => {
+  await removeAi(s.name);
+  await docker.getVolume(aiVolume(s.name)).remove().catch(() => {});
+  if (aiKeys[s.name]) { delete aiKeys[s.name]; saveAiKeys(); }
   await removeContainer(s.name);
   if (req.query.deleteWorld === '1') {
     await docker.getVolume(`mc-${s.name}-data`).remove().catch(() => {});
@@ -458,10 +645,15 @@ app.get('/api/servers/:name/logs', wrap(async (req, res) => {
 app.get('/api/servers/:name/logs/stream', wrap(async (req, res) => {
   const s = servers[req.params.name];
   if (!s) return res.status(404).json({ error: 'Server not found' });
+  await streamLogs(cname(s.name), !!(await inspect(s.name)), req, res);
+}));
+
+// SSE: `event: reset` first, then one `data: "<line>"` per log line; ends when the container stops
+async function streamLogs(container, exists, req, res) {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
   res.write('event: reset\ndata: {}\n\n');
-  if (!(await inspect(s.name))) { res.write('retry: 5000\n\n'); return res.end(); }
-  const stream = await docker.getContainer(cname(s.name)).logs({ follow: true, stdout: true, stderr: true, tail: 500 });
+  if (!exists) { res.write('retry: 5000\n\n'); return res.end(); }
+  const stream = await docker.getContainer(container).logs({ follow: true, stdout: true, stderr: true, tail: 500 });
   let buf = '';
   stream.on('data', (chunk) => {
     buf += chunk.toString('utf8');
@@ -474,7 +666,7 @@ app.get('/api/servers/:name/logs/stream', wrap(async (req, res) => {
   stream.on('end', () => { done(); res.write('retry: 3000\n\n'); res.end(); }); // container stopped/restarted -> client reconnects
   stream.on('error', () => { done(); res.end(); });
   req.on('close', done);
-}));
+}
 
 // CPU / RAM of one server container
 app.get('/api/servers/:name/stats', wrap(async (req, res) => {
@@ -515,11 +707,14 @@ app.post('/api/servers/:name/regenerate', withServer(async (s, req, res) => {
   if (req.body?.levelType) input.levelType = req.body.levelType;
   const updated = { ...sanitize(input, s), name, port, createdAt };
   await backup(s, 'regenerate'); // old world is kept as a backup
+  await removeAi(name);
+  await docker.getVolume(aiVolume(name)).remove().catch(() => {}); // agents' memories are about the old world
   await removeContainer(name);
   await runHelper(s, ['sh', '-c', REGEN_SCRIPT], [`mc-${name}-data:/data`]);
   servers[name] = updated;
   saveServers(servers);
   await createContainer(updated); // starts and generates a fresh world
+  resumeAiWhenHealthy(name);
   res.json(await status(updated));
 }));
 
@@ -540,6 +735,7 @@ app.post('/api/servers/:name/backups/:file/restore', withServer(async (s, req, r
   const { name, port, createdAt } = s;
   let next = s;
   if (req.body?.restoreSettings && meta?.settings) next = { ...sanitize(meta.settings, s), name, port, createdAt };
+  await removeAi(name);
   const wasRunning = await removeContainer(name);
   await runHelper(s, ['sh', '-c', RESTORE_SCRIPT, 'sh', `/backups/${name}/${file}`],
     [`mc-${name}-data:/data`, `${BACKUP_VOLUME}:/backups:ro`]);
@@ -547,7 +743,82 @@ app.post('/api/servers/:name/backups/:file/restore', withServer(async (s, req, r
   saveServers(servers);
   await createContainer(next);
   if (!wasRunning) await docker.getContainer(cname(name)).stop({ t: 60 }).catch(() => {});
+  else resumeAiWhenHealthy(name);
   res.json(await status(next));
+}));
+
+// ---------- AI agents API ----------
+async function aiState(s) {
+  const info = await aiInspect(s.name);
+  let gate = null;
+  if (info?.State.Running) {
+    try { gate = JSON.parse(await execText(aiCname(s.name), ['cat', '/data/gate.json'], 3000)); } catch {}
+  }
+  const { wanted, ...config } = aiOf(s);
+  return {
+    config, wanted, hasKey: !!aiKeys[s.name],
+    state: info ? info.State.Status : 'none', // running / restarting / exited / none
+    startedAt: info?.State.Running ? info.State.StartedAt : null,
+    restarts: info?.RestartCount || 0,
+    gate, problems: await aiProblems(s, { needRunning: false }),
+    supportedVersions: AI_SUPPORTED, providers: Object.keys(AI_PROVIDERS),
+  };
+}
+
+app.get('/api/servers/:name/ai', wrap(async (req, res) => {
+  const s = servers[req.params.name];
+  if (!s) return res.status(404).json({ error: 'Server not found' });
+  res.json(await aiState(s));
+}));
+
+app.put('/api/servers/:name/ai', withServer(async (s, req, res) => {
+  const { wanted, ...cur } = aiOf(s);
+  const next = sanitizeAi(req.body || {}, cur);
+  const key = String(req.body?.apiKey ?? '').trim();
+  if (key) {
+    if (!/^[\x21-\x7e]{10,400}$/.test(key)) throw new BadRequest('API key looks invalid');
+    aiKeys[s.name] = key;
+    saveAiKeys();
+  }
+  s.ai = { ...next, wanted };
+  saveServers(servers);
+  if ((await aiInspect(s.name))?.State.Running) {
+    const problems = await aiProblems(s);
+    if (problems.length) { await removeAi(s.name); throw new BadRequest(`Saved, but agents stopped: ${problems.join('; ')}`); }
+    await startAi(s); // apply new config right away (agent memory is kept)
+  }
+  res.json(await aiState(s));
+}));
+
+app.post('/api/servers/:name/ai/start', withServer(async (s, req, res) => {
+  const problems = await aiProblems(s);
+  if (problems.length) throw new BadRequest(problems.join(' · '));
+  await backup(s, 'ai'); // the world as it was before the agents touched it
+  s.ai = { ...aiOf(s), wanted: true };
+  saveServers(servers);
+  await startAi(s);
+  res.json(await aiState(s));
+}));
+
+app.post('/api/servers/:name/ai/stop', withServer(async (s, req, res) => {
+  s.ai = { ...aiOf(s), wanted: false };
+  saveServers(servers);
+  await removeAi(s.name);
+  res.json(await aiState(s));
+}));
+
+// Forget everything the agents learned (sessions, notes, quota counter). Their in-game items stay in the world.
+app.delete('/api/servers/:name/ai/memory', withServer(async (s, req, res) => {
+  if ((await aiInspect(s.name))?.State.Running) throw new BadRequest('Pehle AI agents stop karo');
+  await removeAi(s.name);
+  await docker.getVolume(aiVolume(s.name)).remove().catch(() => {});
+  res.json(await aiState(s));
+}));
+
+app.get('/api/servers/:name/ai/logs/stream', wrap(async (req, res) => {
+  const s = servers[req.params.name];
+  if (!s) return res.status(404).json({ error: 'Server not found' });
+  await streamLogs(aiCname(s.name), !!(await aiInspect(s.name)), req, res);
 }));
 
 app.get('/api/servers/:name/backups/:file/download', wrap(async (req, res) => {

@@ -1,3 +1,4 @@
 .env
 node_modules/
 panel/node_modules/
+ai-agents/test/out/

@@ -1,0 +1,72 @@
+{
+  "name": "minecraft-agent-harness",
+  "version": "0.1.0",
+  "description": "Minecraft agents with persistent model sessions, shell sandboxes and Mineflayer tools.",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "minecraft-agent": "bin/minecraft-agent.js"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "bin",
+    "patches",
+    "src"
+  ],
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "start": "node bin/minecraft-agent.js",
+    "postinstall": "patch-package",
+    "test": "node --test \"test/**/*.test.js\"",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "npm run lint && npm run format:check && npm test",
+    "server": "node scripts/dev-server.js",
+    "vision:install": "npm install --no-save prismarine-viewer@1.33.0 node-canvas-webgl@0.3.0 && patch-package --patch-dir src/vision/patches"
+  },
+  "keywords": [
+    "minecraft",
+    "mineflayer",
+    "agent",
+    "llm",
+    "pi",
+    "ai"
+  ],
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.82.0",
+    "@earendil-works/pi-coding-agent": "0.82.0",
+    "e2b": "^2.59.0",
+    "minecraft-data": "3.119.0",
+    "mineflayer": "4.39.0",
+    "mineflayer-collectblock": "1.6.0",
+    "mineflayer-pathfinder": "2.4.5",
+    "mineflayer-pvp": "1.3.2",
+    "patch-package": "^8.0.1",
+    "prismarine-item": "1.18.0",
+    "ses": "1.15.0",
+    "vec3": "0.1.10"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "prettier": "^3.9.10"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yc-software/minecraft-agent-harness.git"
+  },
+  "homepage": "https://github.com/yc-software/minecraft-agent-harness#readme",
+  "bugs": {
+    "url": "https://github.com/yc-software/minecraft-agent-harness/issues"
+  }
+}

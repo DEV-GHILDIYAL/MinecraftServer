@@ -13,6 +13,13 @@ services:
       # World backups (also mounted by short-lived helper containers, so the name must stay "mc-backups")
       - backups:/app/backups
 
+  # Image for the AI agents (never started by compose; the panel creates one container per server).
+  # Build/update it with:  docker compose --profile ai build ai-agents
+  ai-agents:
+    build: ./ai-agents
+    image: craftpanel-ai-agents:latest
+    profiles: ["ai"]
+
 volumes:
   panel-data:
   backups:

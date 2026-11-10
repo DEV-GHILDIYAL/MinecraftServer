@@ -1,0 +1,13 @@
+{
+  "providers": {
+    "fake": {
+      "baseUrl": "http://host.docker.internal:18080/v1",
+      "api": "openai-completions",
+      "apiKey": "not-a-real-key",
+      "compat": { "supportsDeveloperRole": false, "supportsReasoningEffort": false },
+      "models": [
+        { "id": "scripted", "name": "Scripted test model", "reasoning": false, "input": ["text"], "contextWindow": 200000, "maxTokens": 4096 }
+      ]
+    }
+  }
+}

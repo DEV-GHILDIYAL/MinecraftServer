@@ -81,6 +81,7 @@ function showLogin() {
   state.timers.forEach(clearInterval);
   state.timers = [];
   state.es?.close();
+  closeAiStream();
   $('#app-view').classList.add('hidden');
   $('#login-view').classList.remove('hidden');
   $('#password').focus();
@@ -109,6 +110,7 @@ async function boot() {
   state.timers.push(setInterval(refreshHost, 10000));
   state.timers.push(setInterval(refreshStats, 3000));
   state.timers.push(setInterval(tickUptime, 1000));
+  state.timers.push(setInterval(() => { if (state.tab === 'ai' && current()) loadAi(current(), false); }, 5000));
 }
 
 async function refreshServers() {
@@ -196,7 +198,7 @@ function openLogStream() {
   state.es = null;
   if (!state.selected) return;
   const es = new EventSource(`/api/servers/${encodeURIComponent(state.selected)}/logs/stream`);
-  es.addEventListener('reset', () => { state.logs = []; $$('.console').forEach((c) => c.replaceChildren()); });
+  es.addEventListener('reset', () => { state.logs = []; $$('.console:not(.ai)').forEach((c) => c.replaceChildren()); });
   es.onmessage = (e) => { try { pushLog(JSON.parse(e.data)); } catch {} };
   state.es = es;
 }
@@ -212,7 +214,7 @@ function renderMain() {
       el('button', { class: 'mc-btn green', style: 'padding:12px 22px;font-size:15px', onclick: () => openCreate() }, '+ Create your first server')));
     return;
   }
-  const tabs = [['overview', '📊 Overview'], ['console', '⌨ Console'], ['players', '👥 Players'], ['backups', '💾 Backups'], ['settings', '⚙ Settings']];
+  const tabs = [['overview', '📊 Overview'], ['console', '⌨ Console'], ['players', '👥 Players'], ['ai', '🤖 AI'], ['backups', '💾 Backups'], ['settings', '⚙ Settings']];
   main.replaceChildren(
     renderHero(s),
     el('div', { class: 'tabs' }, tabs.map(([id, label]) => el('button', {
@@ -222,8 +224,10 @@ function renderMain() {
     el('div', { id: 'tab-body' }, state.tab === 'console' ? renderConsoleTab()
       : state.tab === 'players' ? renderPlayersTab(s)
         : state.tab === 'backups' ? renderBackupsTab(s)
+        : state.tab === 'ai' ? renderAiTab(s)
         : state.tab === 'settings' ? renderSettingsTab(s)
           : renderOverviewTab(s)));
+  if (state.tab === 'ai') openAiStream(s.name); else closeAiStream();
   paintConsoles();
   updateLive();
   updateStats();
@@ -436,7 +440,7 @@ function lineNode(line) {
 const visible = (line) => !(state.hideNoise && NOISE.test(line)) && (!state.filter || line.toLowerCase().includes(state.filter.toLowerCase()));
 
 function paintConsoles() {
-  for (const c of $$('.console')) {
+  for (const c of $$('.console:not(.ai)')) {
     const lines = state.logs.filter(visible);
     const slice = c.dataset.mini ? lines.slice(-150) : lines;
     c.replaceChildren(...slice.map(lineNode));
@@ -449,7 +453,7 @@ function pushLog(line) {
   state.logs.push(line);
   if (state.logs.length > MAX_LOGS) state.logs.splice(0, state.logs.length - MAX_LOGS);
   if (!visible(line)) return;
-  for (const c of $$('.console')) {
+  for (const c of $$('.console:not(.ai)')) {
     const placeholder = c.querySelector('.ln[style]');
     if (placeholder) placeholder.remove();
     const nearBottom = c.scrollTop + c.clientHeight >= c.scrollHeight - 40;
@@ -645,8 +649,198 @@ function renderSettingsTab(s) {
 /* ---------- backups ---------- */
 const REASON_LABEL = {
   auto: '⏱ Auto', manual: '✋ Manual', settings: '⚙ Settings change se pehle',
-  regenerate: '🌍 Regenerate se pehle', restore: '↩ Restore se pehle',
+  regenerate: '🌍 Regenerate se pehle', restore: '↩ Restore se pehle', ai: '🤖 AI start se pehle',
 };
+
+/* ---------- AI agents ---------- */
+const AI_MODELS = [
+  ['google/gemini-flash-lite-latest', 'Gemini Flash-Lite: free tier mein sabse zyada requests/day (recommended)'],
+  ['google/gemini-flash-latest', 'Gemini Flash: smart, lekin free tier mein bahut kam requests/day'],
+];
+const AI_STATE = {
+  running: ['online', 'Running'], restarting: ['starting', 'Restarting…'], created: ['starting', 'Starting…'],
+  exited: ['offline', 'Stopped'], none: ['offline', 'Stopped'], dead: ['offline', 'Crashed'],
+};
+
+function renderAiTab(s) {
+  loadAi(s, true);
+  return el('div', { style: 'display:grid;gap:14px' },
+    el('div', { class: 'card', id: 'ai-status' }, el('span', { class: 'muted' }, 'Loading…')),
+    el('div', { class: 'card' },
+      el('div', { class: 'card-title' }, el('span', {}, '● AI activity (live)'),
+        el('span', { class: 'muted', style: 'font-size:12px;font-weight:400' }, '💬 = agents ki aapas mein baat')),
+      el('div', { class: 'console full ai', id: 'ai-console' })),
+    el('div', { id: 'ai-form-wrap' }));
+}
+
+async function loadAi(s, withForm) {
+  let d;
+  try { d = await api(`/api/servers/${encodeURIComponent(s.name)}/ai`); } catch (err) { if (withForm) toast(err.message, true); return; }
+  if (state.selected !== s.name || state.tab !== 'ai') return;
+  state.ai = d;
+  paintAiStatus(s, d);
+  if (withForm) $('#ai-form-wrap')?.replaceChildren(aiForm(s, d));
+}
+
+function paintAiStatus(s, d) {
+  const box = $('#ai-status');
+  if (!box) return;
+  const [cls, label] = AI_STATE[d.state] || ['offline', d.state];
+  const running = d.state === 'running' || d.state === 'restarting';
+  const g = d.gate;
+  const act = (path, okMsg, btnLabel, color, confirmText) => {
+    const b = el('button', { class: `mc-btn ${color}`, onclick: async () => {
+      const go = async () => {
+        b.disabled = true; b.replaceChildren(el('span', { class: 'spin' }), ' ', btnLabel);
+        try { const r = await api(`/api/servers/${encodeURIComponent(s.name)}/ai${path}`, { method: path === '/memory' ? 'DELETE' : 'POST' }); toast(okMsg); state.ai = r; paintAiStatus(s, r); } catch (err) { toast(err.message, true); }
+        b.disabled = false; b.replaceChildren(btnLabel);
+      };
+      if (confirmText) confirmModal(btnLabel + '?', confirmText, btnLabel, go); else go();
+    } }, btnLabel);
+    return b;
+  };
+  let quota = 'Aaj ki requests: —';
+  if (g?.fatal) d.problems = [`Agents ruk gaye: ${g.fatal}`, ...d.problems];
+  if (g) {
+    quota = `Aaj ki requests: ${g.count}${g.dailyCap ? ` / ${g.dailyCap}` : ''} · ${g.rpm}/min`;
+    if (g.blockedUntil > Date.now()) {
+      quota += g.lastBlock === 'daily'
+        ? ` · ⏸ Free quota khatam. Agents ${new Date(g.blockedUntil).toLocaleString()} tak ruke hain`
+        : ` · ⏸ Rate limit, ${Math.ceil((g.blockedUntil - Date.now()) / 1000)}s mein phir chalenge`;
+    }
+  }
+  box.replaceChildren(
+    el('div', { class: 'danger-zone', style: 'border:0;background:none;padding:0' },
+      el('div', {},
+        el('div', { style: 'display:flex;align-items:center;gap:10px;flex-wrap:wrap' },
+          el('b', {}, `🤖 ${d.config.agents.map((a) => a.name).join(', ')}`),
+          el('span', { class: `pill ${cls}` }, el('span', { class: `dot ${cls}` }), label)),
+        el('div', { class: 'muted', style: 'font-size:12.5px;margin-top:4px' },
+          `${d.config.model} · ${quota}${d.restarts ? ` · restarts: ${d.restarts}` : ''}`)),
+      el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' },
+        running
+          ? act('/stop', '■ AI agents stopped', '■ Stop AI', 'red')
+          : act('/start', '🤖 AI agents aa rahe hain! (pehle world ka backup liya gaya)', '▶ Start AI', 'green'),
+        running ? null : act('/memory', '🧹 AI memory reset', '🧹 Reset memory', 'ghost',
+          'Agents sab kuch bhool jayenge (plans, notes, rules). World mein unka saaman aur ghar waise hi rahenge.'))),
+    d.problems.length ? el('div', { class: 'ai-problems' }, d.problems.map((p) => el('div', {}, '⚠ ', p))) : null);
+}
+
+function aiForm(s, d) {
+  const c = d.config;
+  const err = el('p', { class: 'error' });
+  const btn = el('button', { class: 'mc-btn green', type: 'submit' }, '💾 Save AI settings');
+  const rows = el('div', { style: 'display:grid;gap:8px' });
+  const addRow = (a = { name: '', personality: '' }) => {
+    if (rows.childElementCount >= 5) return toast('Max 5 agents', true);
+    const row = el('div', { class: 'ai-agent-row' },
+      el('input', { name: 'agent-name', value: a.name, placeholder: 'Name (e.g. Aarav)', maxlength: 16 }),
+      el('input', { class: 'persona', name: 'agent-persona', value: a.personality, placeholder: 'Personality (optional): e.g. brave explorer who loves caves', maxlength: 400 }),
+      el('button', { class: 'mc-btn ghost small', type: 'button', title: 'Remove', onclick: () => { if (rows.childElementCount > 1) row.remove(); } }, '✕'));
+    rows.append(row);
+  };
+  c.agents.forEach(addRow);
+  // new-password + "typed" flag: browsers love to autofill a saved login password here, which must never be sent as the key
+  let keyTyped = false;
+  const keyInput = el('input', { type: 'password', name: 'apiKey', autocomplete: 'new-password', 'data-lpignore': 'true',
+    oninput: (e) => { keyTyped = e.isTrusted; },
+    placeholder: d.hasKey ? 'Key saved hai (badalni ho to nayi paste karo)' : 'API key (Gemini: aistudio.google.com → Get API key)' });
+  setTimeout(() => { if (!keyTyped) keyInput.value = ''; }, 300); // clear anything autofilled on render
+  const form = el('form', { onsubmit: async (e) => {
+    e.preventDefault();
+    err.textContent = '';
+    const agents = $$('.ai-agent-row', form).map((r) => ({ name: $('[name=agent-name]', r).value.trim(), personality: $('[name=agent-persona]', r).value.trim() }));
+    const body = {
+      model: $('[name=model]', form).value.trim(), thinking: $('[name=thinking]', form).value,
+      rpm: $('[name=rpm]', form).value, dailyCap: $('[name=dailyCap]', form).value,
+      objective: $('[name=objective]', form).value, agents,
+    };
+    if (keyTyped && keyInput.value.trim()) body.apiKey = keyInput.value.trim();
+    btn.disabled = true; btn.replaceChildren(el('span', { class: 'spin' }), ' Saving…');
+    try {
+      const r = await api(`/api/servers/${encodeURIComponent(s.name)}/ai`, { method: 'PUT', body });
+      toast(r.state === 'running' ? '✅ Saved. Agents nayi settings ke saath restart ho rahe hain' : '✅ AI settings saved');
+      state.ai = r;
+      paintAiStatus(s, r);
+      $('#ai-form-wrap')?.replaceChildren(aiForm(s, r));
+    } catch (ex) { err.textContent = ex.message; btn.disabled = false; btn.replaceChildren('💾 Save AI settings'); }
+  } },
+  el('div', { class: 'form-sections' },
+    el('div', { class: 'card' }, el('div', { class: 'card-title' }, '🧠 AI model'),
+      el('div', { class: 'form-grid' },
+        el('label', { class: 'field full' }, 'Model (provider/model)',
+          el('input', { name: 'model', value: c.model, list: 'ai-models', autocomplete: 'off' }),
+          el('datalist', { id: 'ai-models' }, AI_MODELS.map(([v, t]) => el('option', { value: v }, t))),
+          el('span', { class: 'hint' }, `Providers: ${d.providers.join(', ')}. Free ke liye Gemini Flash-Lite best hai.`)),
+        el('label', { class: 'field full' }, 'API key', keyInput,
+          el('span', { class: 'hint' }, 'Key sirf panel ke server par save hoti hai, browser ko wapas kabhi nahi bheji jaati.')),
+        el('label', { class: 'field' }, 'Requests per minute (sab agents milke)',
+          el('input', { type: 'number', name: 'rpm', value: c.rpm, min: 1, max: 120 }),
+          el('span', { class: 'hint' }, 'Free tier: 10 ke aas-paas rakho')),
+        el('label', { class: 'field' }, 'Requests per day (limit)',
+          el('input', { type: 'number', name: 'dailyCap', value: c.dailyCap, min: 0 }),
+          el('span', { class: 'hint' }, 'Free tier ki daily limit se thoda kam. 0 = koi limit nahi')),
+        el('label', { class: 'field' }, 'Thinking',
+          el('select', { name: 'thinking' }, ['off', 'minimal', 'low', 'medium', 'high'].map((o) => el('option', { value: o, selected: o === c.thinking }, o))),
+          el('span', { class: 'hint' }, 'low = sasta aur theek-thaak smart')))),
+    el('div', { class: 'card' }, el('div', { class: 'card-title' }, el('span', {}, '👥 Agents (1–5)'),
+      el('button', { class: 'mc-btn ghost small', type: 'button', onclick: () => addRow() }, '+ Agent')),
+      rows,
+      el('p', { class: 'muted', style: 'font-size:12px;margin:10px 0 0' }, 'Naam = Minecraft username. Real players ya OPs ke naam mat rakhna.')),
+    el('div', { class: 'card' }, el('div', { class: 'card-title' }, '🎯 Agents ka maqsad (objective)'),
+      el('textarea', { name: 'objective', rows: 7, maxlength: 3000 }, c.objective),
+      el('p', { class: 'muted', style: 'font-size:12px;margin:8px 0 0' }, '{peers} ki jagah baaki agents ke naam aa jaate hain. English mein likhna AI ke liye best hai.'))),
+  el('div', { class: 'form-foot' }, el('span', { class: 'note' }, '⚠ Agents chal rahe hon to save karne par wo restart honge (memory safe rehti hai).'), btn), err);
+  return form;
+}
+
+function openAiStream(name) {
+  if (state.aiEs && state.aiEsFor === name) { paintAiConsole(); return; }
+  closeAiStream();
+  state.aiEsFor = name;
+  state.aiLogs = [];
+  const es = new EventSource(`/api/servers/${encodeURIComponent(name)}/ai/logs/stream`);
+  es.addEventListener('reset', () => { state.aiLogs = []; paintAiConsole(); });
+  es.onmessage = (e) => {
+    try {
+      state.aiLogs.push(JSON.parse(e.data));
+      if (state.aiLogs.length > 2000) state.aiLogs.splice(0, state.aiLogs.length - 2000);
+      const c = $('#ai-console');
+      if (!c) return;
+      c.querySelector('.ln[style]')?.remove();
+      const near = c.scrollTop + c.clientHeight >= c.scrollHeight - 40;
+      c.append(aiLineNode(state.aiLogs[state.aiLogs.length - 1]));
+      if (near) c.scrollTop = c.scrollHeight;
+    } catch {}
+  };
+  state.aiEs = es;
+  paintAiConsole();
+}
+function closeAiStream() {
+  state.aiEs?.close();
+  state.aiEs = null;
+  state.aiEsFor = null;
+}
+function paintAiConsole() {
+  const c = $('#ai-console');
+  if (!c) return;
+  c.replaceChildren(...(state.aiLogs || []).map(aiLineNode));
+  if (!c.childElementCount) c.append(el('span', { class: 'ln', style: 'color:var(--dim)' }, 'AI agents abhi nahi chal rahe. "▶ Start AI" dabao.'));
+  c.scrollTop = c.scrollHeight;
+}
+
+// Log lines from ai-agents/runner.mjs + harness: "[dm] Aarav → Meera: ...", "[gate] ...", "[Aarav] > dig ok 1.2s: ..."
+function aiLineNode(line) {
+  const dm = /^\[dm\] ([A-Za-z0-9_]{1,16}) → ([A-Za-z0-9_]{1,16}): (.*)$/.exec(line);
+  if (dm) return el('span', { class: 'ln dm' }, '💬 ', el('span', { class: 'who' }, dm[1]), ` → ${dm[2]}: ${dm[3]}`, '\n');
+  const m = /^\[([A-Za-z0-9_]{1,16})\] (.*)$/.exec(line);
+  if (!m) return el('span', { class: 'ln' }, line.length > 400 ? line.slice(0, 400) + '…' : line, '\n');
+  const who = m[1];
+  const rest = m[2].length > 400 ? m[2].slice(0, 400) + '…' : m[2];
+  const cls = who === 'gate' ? 'warn' : /^x /.test(rest) || /stopping \(|error/i.test(rest) ? 'err'
+    : /^"/.test(rest) ? 'init' : /spawned|connecting|resumed|new session/.test(rest) ? 'ok' : '';
+  return el('span', { class: `ln ${cls}` }, el('span', { class: 'who' }, `[${who}] `), rest, '\n');
+}
 
 function renderBackupsTab(s) {
   const b = state.config.backup || {};

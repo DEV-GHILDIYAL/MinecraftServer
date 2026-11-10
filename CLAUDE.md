@@ -29,6 +29,7 @@ There's no build step, no framework, no database, no tests. Everything is plain 
 | `panel/public/style.css` | Minecraft-themed dark UI; colour tokens on `:root` |
 | `panel/Dockerfile` | `node:20-alpine`, `npm install --omit=dev`, `node server.js` |
 | `docker-compose.yml` | Panel service only; mounts docker.sock + `panel-data` volume |
+| `ai-agents/` | Docker image for LLM agents (minecraft-agent-harness pinned + rate-limit gate). See `ai-agents/README.md` |
 | `setup.sh` | One-time EC2 bootstrap: Docker, 2G swap, `.env` generation, ufw, image pre-pull, `compose up` |
 | `.env.example` | `ADMIN_PASSWORD`, `SESSION_SECRET`, `PUBLIC_HOST`, `PANEL_PORT`, `MC_PORT_START/END`, `TZ`, `BACKUP_INTERVAL_HOURS`, `BACKUP_KEEP` |
 
@@ -84,6 +85,29 @@ There's no build step, no framework, no database, no tests. Everything is plain 
 | POST | `/api/servers/:name/backups/:file/restore` `{restoreSettings}` | safety backup → wipe `/data` (keeps libraries/versions/cache) → untar |
 | GET | `/api/servers/:name/backups/:file/download` | the .tgz file |
 | DELETE | `/api/servers/:name/backups/:file` | |
+
+| GET | `/api/servers/:name/ai` | `{config, wanted, hasKey, state, gate, problems, ...}` (the key is never returned) |
+| PUT | `/api/servers/:name/ai` | save config (+ `apiKey`); restarts agents if they're running |
+| POST | `/api/servers/:name/ai/start` \| `/ai/stop` | start runs `aiProblems()` checks → `backup(s,'ai')` → container |
+| DELETE | `/api/servers/:name/ai/memory` | removes the `mc-<name>-ai-state` volume (agents must be stopped) |
+| GET | `/api/servers/:name/ai/logs/stream` | SSE of the agent container's logs |
+
+### AI agents (`ai-agents/`, see its README)
+- One container per server: `mc-<name>-ai` from image `craftpanel-ai-agents:latest`, built with
+  `docker compose --profile ai build ai-agents`. Agent memory lives in the volume `mc-<name>-ai-state`.
+- Config is stored in `servers[name].ai` (`aiOf(s)` merges `AI_DEFAULTS`). The **API key is stored separately** in
+  `data/ai-keys.json` (0600) so `status()`'s `...s` spread and the backup `.json` snapshots never contain it.
+- `aiProblems()` gates every start: image built, key set, `aiProtocolFor(s.version)` is set (26.1 / 26.1.1 / 26.1.2,
+  all protocol 775; `LATEST` is refused because it silently upgrades the world),
+  `onlineMode` off, no agent name in `ops`, and server healthy. Never lower a server's version to make it pass,
+  because downgrading a world can corrupt it.
+- Lifecycle hooks: server stop → `removeAi`. Start/restart/settings save/restore/regenerate → `resumeAiWhenHealthy`
+  (only if `ai.wanted`). Regenerate and delete also wipe the AI state volume. Delete also drops the key.
+- Agents connect via `host.docker.internal:<s.port>` (`ExtraHosts: host-gateway`). Whitelisted servers get
+  `whitelist add <agent>` over RCON at start.
+- Safety model: offline survival players without OP. The harness blocks slash commands. `sandbox: none` and
+  `sharedMachine: none` mean no shell. The container drops all caps and gets no docker.sock. The world rules in the
+  objective are prompt-only. Rate limiting happens in `ai-agents/throttle.mjs` plus the runner gate, not in the harness.
 
 ### Backups
 - Stored in the volume **`mc-backups`** (fixed name in compose), mounted in the panel at `/app/backups/<server>/`.
